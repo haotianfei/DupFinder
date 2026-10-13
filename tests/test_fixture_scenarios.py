@@ -78,14 +78,14 @@ def test_cache_cold_and_warm_states(dup_tree_factory):
 
 
 def test_factory_builds_independent_trees(dup_tree_factory):
-    """factory 可在一个用例内建多棵互不干扰的隔离树：一棵跑扫描，另一棵终态零变化。"""
+    """factory 可在一个用例内建多棵互不干扰的隔离树：一棵跑真实扫描，另一棵终态零变化。"""
     t1 = dup_tree_factory("first")
     t2 = dup_tree_factory("second")
     assert t1.workdir != t2.workdir and t1.workdir.is_dir() and t2.workdir.is_dir()
 
     t1.build_minimal()
     before2 = t2.snapshot()
-    proc = t1.run_scan()
+    proc = t1.run("-d", "A", "B")  # 真实扫描模式才会产出结果文件
     assert proc.returncode == 0, proc.stderr
 
     data, path = t1.load_result_json()
@@ -97,7 +97,7 @@ def test_factory_builds_independent_trees(dup_tree_factory):
 def test_terminal_state_helpers(dup_tree):
     """终态断言辅助可靠：无变化时 changed_paths 为空集；新增/篡改能被精确点名；
     assert_file_unchanged 对未动文件通过、assert_no_file_changed 对已动树抛错；
-    一次 --try-run 扫描不新增任何源文件变化，产物文件确实生成且落在 workdir。"""
+    一次 --try-run 扫描不新增任何源文件变化，且正式产物零写入、日志仍落在 workdir。"""
     t = dup_tree
     t.build_minimal()
     before = t.snapshot()
@@ -122,12 +122,10 @@ def test_terminal_state_helpers(dup_tree):
     t.assert_no_file_changed(stable)
     assert t.changed_paths(before) == {"A/extra_note.txt", "A/x_cross.txt"}
 
-    # 结果 JSON 唯一、落在 workdir；篡改后树内已无重复 → {}（现状行为：按内容哈希成组）
-    data, path = t.load_result_json()
-    assert path.parent == t.workdir
-    assert data == {}
-
-    # artifact_digests：产物文件 → sha256 映射，扫描后非空，供"产物是否变化"断言复用
+    # 演练模式零正式产物：不写结果 JSON、不写缓存；日志照常落在 workdir（隔离在位）
+    assert list(t.workdir.glob("duplicates_*.json")) == []
+    assert not t.cache_path().exists()
     digests = t.artifact_digests()
-    assert any(name.startswith("duplicates_") for name in digests)
     assert any(name.startswith("logs/") for name in digests)
+    assert not any(name.startswith("duplicates_") for name in digests)
+    assert "file_cache.json" not in digests

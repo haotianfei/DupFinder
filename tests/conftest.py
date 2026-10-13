@@ -43,6 +43,15 @@ LOG_BASENAMES = ("DupFinder.log", "logger.log")
 # 子进程的缓存文件名由 dup_finder 内部默认值决定（CLI 无参数可改），helper 与之一致
 CACHE_BASENAME = "file_cache.json"
 
+
+def console_output(proc):
+    """CLI 子进程的控制台输出合并文本。
+
+    logging 的控制台 handler 挂在 stderr，但测试统一看 stdout+stderr 合并文本，
+    不绑定具体流归属（后续若日志收紧改流也不受影响）。各测试文件共用此函数。
+    """
+    return (proc.stdout or "") + (proc.stderr or "")
+
 # 各场景内容长度：0（两个空文件）与刻意成对的重复内容之外，其余全局唯一。
 LEN_CROSS = 1000       # 跨目录重复对共享大小
 LEN_INDIR = 2000       # 目录内部重复对共享大小
