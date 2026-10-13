@@ -262,22 +262,67 @@ def test_single_stat_output_equivalence(full_tree):
     assert _project(data) == expected
 
 
+UNIQUE_SIZE_SENTINEL = "Z:unique-size"  # CLI 行为契约字符串：含非 hex 字符，任何摘要都不等于它
+
+
+def _prefilter_cache_expectation(t, min_size=1):
+    """按两阶段预过滤规则复算每个缓存条目的期望 file_id。
+
+    阶段一存活集 = 非软链接、可 stat、常规文件、size>=min_size 的文件（含后续不可读
+    者——stat 成功即入组）。存活集内 size 唯一 → 期望哨兵；同 size >= 2 → 进哈希队列，
+    可读者期望真实 sha256、不可读者无条目。这是纯外部行为规则的独立复算（oracle），
+    不导入被测模块。
+    """
+    groups = {}
+    for base in ("A", "B"):
+        for p in sorted((t.workdir / base).rglob("*")):
+            if p.is_symlink():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size < min_size:
+                continue
+            groups.setdefault(st.st_size, []).append(str(p.relative_to(t.workdir)))
+    expected = {}
+    for paths in groups.values():
+        if len(paths) == 1:
+            expected[paths[0]] = UNIQUE_SIZE_SENTINEL
+        else:
+            for rel in paths:
+                p = t.workdir / rel
+                try:
+                    with open(p, "rb") as f:
+                        expected[rel] = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    continue
+    return expected
+
+
 def test_excluded_files_get_no_cache_entries_and_format_stays_compatible(full_tree):
-    """真实扫描后缓存条目格式与既有文件完全一致（key=路径，value 三字段），
-    0 字节/软链接/不可读文件零条目，候选条目值与运行前基线逐字段吻合。"""
+    """真实扫描后缓存条目格式与既有文件完全一致（key=路径，value 三字段）；
+    0 字节/软链接/读取失败文件零条目；size 唯一者入哨兵条目、同 size>=2 可读者入
+    真实哈希条目（规则见 _prefilter_cache_expectation），size/mtime 与运行前基线逐字段吻合。"""
     t = full_tree
     baseline = _candidate_bytes_before_run(t)
+    expected_ids = _prefilter_cache_expectation(t)
     proc = _real_run(t)
     assert proc.returncode == 0, console_output(proc)
 
     cache = json.loads(t.cache_path().read_text())
+    assert set(cache) == set(expected_ids)
     assert set(cache) == set(baseline)
     assert set(cache["A/x_cross.txt"]) == {"file_id", "modified_time", "size"}
     for rel, entry in cache.items():
-        digest, size, mtime = baseline[rel]
-        assert entry["file_id"] == digest
+        assert entry["file_id"] == expected_ids[rel]
+        _, size, mtime = baseline[rel]
         assert entry["size"] == size
         assert entry["modified_time"] == mtime
+
+    # 哨兵绝不参与分组：结果 JSON 的组 key 里没有它
+    data, _ = t.load_result_json()
+    assert UNIQUE_SIZE_SENTINEL not in data
 
 
 def test_warm_cache_reused_without_rehash(dup_tree_factory):

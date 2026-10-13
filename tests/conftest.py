@@ -44,6 +44,14 @@ LOG_BASENAMES = ("DupFinder.log", "logger.log")
 CACHE_BASENAME = "file_cache.json"
 
 
+def pytest_configure(config):
+    # 登记自定义标记，避免 "unknown mark" 警告（标记登记属于测试收集配置，落在 tests/ 内）
+    config.addinivalue_line(
+        "markers",
+        "slow: 较慢的集成用例（真实大缓存载入与命中验证），可 `-m 'not slow'` 跳过",
+    )
+
+
 def console_output(proc):
     """CLI 子进程的控制台输出合并文本。
 
@@ -212,9 +220,17 @@ class DupTree:
         return target, link
 
     def add_unreadable_file(self):
-        """不可读文件（chmod 000）。"""
+        """不可读文件（chmod 000）+ 一个同尺寸可读伴生文件。
+
+        两者共享 size，按大小预过滤后必然进入内容哈希阶段——对不可读文件的
+        "警告并跳过"路径由此可被真实触发（若不可读文件 size 唯一，会被哨兵
+        短路、根本不读内容，警告无从产生）。伴生文件内容不同，自身成不了重复组。
+        """
         self.unreadable_content = _payload(LEN_UNREADABLE)
-        return self.add_unreadable("A/secret.bin", self.unreadable_content)
+        twin_content = b"twin-" * (LEN_UNREADABLE // 5)
+        self.twin_file = self.add_file("B/readable_twin.bin", twin_content)
+        p = self.add_unreadable("A/secret.bin", self.unreadable_content)
+        return p
 
     def add_unique_size_files(self):
         """size 全局唯一文件：A、B 各一，大小不与树内任何其他文件相同。"""

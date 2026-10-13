@@ -16,6 +16,13 @@ from logger import configure_logger
 logger = configure_logger("DupFinder")
 
 
+# 缓存哨兵：标记"文件大小全局唯一，未读内容、永不可能是重复项"。
+# 硬约束：必须永远不可能等于任何十六进制摘要（sha256=64 位小写 hex；此处含非 hex 字符
+# ':' 与 'Z'，且长度 25，任意 hash 输出都不与之相等），因此不会被误当作有效 file_id
+# 参与分组比较，也不会在增量运行中被当成真实缓存命中。
+UNIQUE_SIZE_SENTINEL = "Z:unique-size"
+
+
 class CacheInterrupted(Exception):
     """Raised when SIGINT/SIGTERM arrives while the scan is running.
 
@@ -30,12 +37,15 @@ class CacheInterrupted(Exception):
 
 
 def get_file_hash(file_path, hash_algo=hashlib.sha256):
-    """Calculate the hash of a file."""
-    hash_obj = hash_algo()
+    """Calculate the hash of a file, digesting it as a stream via hashlib.file_digest.
+
+    `hash_algo` accepts an algorithm name string or a no-argument hashlib-style
+    constructor; the resulting hex digest is byte-for-byte identical to the
+    previous manual chunked update loop, so cached values stay compatible.
+    """
+    algorithm = hash_algo if isinstance(hash_algo, str) else hash_algo().name
     with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_obj.update(chunk)
-    return hash_obj.hexdigest()
+        return hashlib.file_digest(f, algorithm).hexdigest()
 
 def generate_file_identifier(file_path):
     """Generate a unique identifier for a file."""
@@ -95,8 +105,11 @@ def get_file_id(file_path, cache, st=None):
 
     The cache hit check reuses the same stat snapshot (`st`) instead of extra
     getmtime/getsize calls: when cached modified_time and size match the
-    snapshot, the cached file_id is returned as-is (no re-hash); otherwise the
-    hash is recomputed and the cache entry updated from the same snapshot.
+    snapshot and the cached value is a real digest (not UNIQUE_SIZE_SENTINEL),
+    the cached file_id is returned as-is (no re-hash). A sentinel never counts
+    as a hit: if this file's size became shared with another file, its content
+    must actually be hashed now. Otherwise the hash is recomputed and the cache
+    entry updated from the same snapshot.
     Raises OSError (incl. PermissionError) for unreadable/vanished files, which
     the caller handles per file.
     """
@@ -107,9 +120,11 @@ def get_file_id(file_path, cache, st=None):
     if file_info:
         cached_modified_time = file_info.get('modified_time')
         cached_size = file_info.get('size')
+        cached_file_id = file_info.get('file_id')
 
-        if cached_modified_time == st.st_mtime and cached_size == st.st_size:
-            return file_info['file_id']
+        if cached_file_id != UNIQUE_SIZE_SENTINEL and \
+                cached_modified_time == st.st_mtime and cached_size == st.st_size:
+            return cached_file_id
 
     file_id = generate_file_identifier(file_path)
     update_cache(cache, file_path, file_id, st)
@@ -127,26 +142,41 @@ def parse_exclude_file(exclude_file):
 def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, exclude_keywords=None, min_size=1, try_run=False):
     """Find duplicate files in the given directories.
 
+    Two-phase size prefiltering:
+    - phase one walks the trees collecting one os.stat snapshot per entry and
+      groups candidates by size only — no file content is read at all;
+    - a file whose size is unique across the whole scan can never have a
+      duplicate, so its content is never hashed: it gets the
+      UNIQUE_SIZE_SENTINEL cache entry instead and never enters any grouping
+      comparison;
+    - phase two hashes (via cache-aware get_file_id) only the files sharing a
+      size with at least one other candidate. Sentinel cache entries never
+      count as hits: when such a file later shares its size with another one,
+      its content is hashed for real.
+
     Scan safety baseline:
     - entries that are symlinks, or smaller than `min_size` bytes (0-byte files
       are excluded with the default min_size=1), never become duplicate
       candidates; they are counted and reported in a final summary line;
     - a per-file OSError (e.g. unreadable or vanished mid-scan) yields exactly
       one warning and the scan continues;
-    - each path is os.stat'ed once and the snapshot feeds cache comparison and
-      the result dict alike, avoiding multi-stat race windows.
+    - each path is os.stat'ed once and the snapshot feeds cache comparison,
+      sentinel bookkeeping and the result dict alike, avoiding multi-stat race
+      windows.
 
     Cache write policy:
-    - the cache file is rewritten only once `batch_size` newly hashed files have
-      accumulated, once again when the scan finishes normally, and once more if
+    - sentinel entries and hashed entries go through the same batched flush:
+      the cache file is rewritten once `batch_size` accumulated entries have
+      built up, once again when the scan finishes normally, and once more if
       SIGINT/SIGTERM interrupts the scan (the flush happens inside the lock;
       afterwards CacheInterrupted is raised and no action is taken on the
       partially scanned data);
     - `try_run` writes nothing at all: the existing cache is still read and
       reused in memory, but no cache file, result file or temp file is created.
 
-    Excluded files get no cache entries, so the existing cache file format and
-    all reusable entries stay untouched.
+    Files skipped before any bookkeeping (symlinks, below min-size, errored)
+    get no cache entries, so the existing cache file format and all reusable
+    sha256 entries stay untouched.
     """
     lock_file = f"{cache_file}.lock"
     lock = FileLock(lock_file)
@@ -186,6 +216,8 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
             previous_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, _stop_on_signal)
         try:
+            # ---- 阶段一：仅收集 (size, stat 快照)，不读任何文件内容 ----
+            size_groups = {}
             directories = list(set(directories))
             for directory in directories:
                 n_dirs_scanned += 1
@@ -195,7 +227,7 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
                         # 每个文件开头检查一次待处理信号（安全点，粒度为单文件，响应为毫秒级）
                         _check_interrupt()
                         file_path = os.path.join(root, file)
-                        logger.debug("Processing file: %s", file_path)
+                        logger.debug("Collecting file: %s", file_path)
                         # 检查文件路径是否包含排除关键字
                         if exclude_keywords and any(keyword in file_path for keyword in exclude_keywords):
                             logger.debug(f"Excluding file: {file_path}")
@@ -206,7 +238,7 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
                                 n_symlink += 1
                                 logger.debug("Skipping symlink: %s", file_path)
                                 continue
-                            # 单一路径一次 os.stat，size/mtime 快照贯穿缓存比对与结果字典
+                            # 单一路径一次 os.stat，快照贯穿缓存比对、哨兵登记与结果字典
                             st = os.stat(file_path)
                             if not stat.S_ISREG(st.st_mode):
                                 logger.debug("Ignoring non-regular file: %s", file_path)
@@ -218,33 +250,64 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
                                 n_small += 1
                                 logger.debug("Skipping file below min-size: %s", file_path)
                                 continue
-                            file_id = get_file_id(file_path, cache, st)
                         except (OSError, PermissionError) as e:
-                            # 单个坏文件（不可读/中途消失等）只警告一次并继续整轮扫描
+                            # 连 stat 都失败的坏文件（中途消失等）也只警告一次并继续整轮扫描
                             logger.warning(f"Error accessing file: {file_path} - {e}")
                             n_error += 1
                             continue
+                        size_groups.setdefault(st.st_size, []).append((file_path, st))
 
-                        file_info = {
-                            'path': file_path,
-                            'size': st.st_size,
-                            'type': os.path.splitext(file_path)[1],
-                            'modified_time': st.st_mtime
-                        }
-                        logger.debug("Process File ID: %s, File Info: %s", file_id, file_info)
+            # ---- size 全局唯一的文件：登记哨兵，不读内容，永不进分组 ----
+            hash_queue = []
+            for i, size in enumerate(sorted(size_groups)):
+                if i % 500 == 0:
+                    _check_interrupt()
+                group = size_groups[size]
+                if len(group) == 1:
+                    file_path, st = group[0]
+                    update_cache(cache, file_path, UNIQUE_SIZE_SENTINEL, st)
+                    cache_updates.append(file_path)
+                    logger.debug("Unique size, recorded sentinel without hashing: %s", file_path)
+                else:
+                    hash_queue.extend(group)
+            _check_interrupt()
+            # 哨兵条目与真实哈希条目共用同一批量落盘通道
+            if len(cache_updates) >= batch_size:
+                if not try_run:
+                    write_cache_to_file(cache, cache_file)
+                cache_updates.clear()
 
-                        if file_id in file_dict:
-                            file_dict[file_id].append(file_info)
-                        else:
-                            file_dict[file_id] = [file_info]
-                        # Track updated cache entries
-                        cache_updates.append(file_path)
+            # ---- 阶段二：仅同 size 候选 >= 2 的文件才真正读取内容做哈希 ----
+            for file_path, st in hash_queue:
+                _check_interrupt()
+                try:
+                    file_id = get_file_id(file_path, cache, st)
+                except (OSError, PermissionError) as e:
+                    # 不可读/中途消失的文件：一条警告后继续，缓存不写其条目
+                    logger.warning(f"Error accessing file: {file_path} - {e}")
+                    n_error += 1
+                    continue
 
-                        # Write cache to file if batch size is reached
-                        if len(cache_updates) >= batch_size:
-                            if not try_run:
-                                write_cache_to_file(cache, cache_file)
-                            cache_updates.clear()
+                file_info = {
+                    'path': file_path,
+                    'size': st.st_size,
+                    'type': os.path.splitext(file_path)[1],
+                    'modified_time': st.st_mtime
+                }
+                logger.debug("Process File ID: %s, File Info: %s", file_id, file_info)
+
+                if file_id in file_dict:
+                    file_dict[file_id].append(file_info)
+                else:
+                    file_dict[file_id] = [file_info]
+                # Track updated cache entries
+                cache_updates.append(file_path)
+
+                # Write cache to file if batch size is reached
+                if len(cache_updates) >= batch_size:
+                    if not try_run:
+                        write_cache_to_file(cache, cache_file)
+                    cache_updates.clear()
             # 最后一个文件之后仍可能有信号到达，在结束扫描前再检查一次
             _check_interrupt()
         except CacheInterrupted as exc:

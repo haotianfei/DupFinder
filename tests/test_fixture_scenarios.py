@@ -35,17 +35,21 @@ def test_factory_builds_all_seven_scenarios(full_tree):
     assert link.readlink().name == "sym_target.txt"
     assert t.byte_identical("B/sym_link.txt", t.sym_content)
 
-    # 5. 不可读文件：权限位 000；非 root 下确实读不了（root 无权限概念，只查权限位）
+    # 5. 不可读文件：权限位 000；非 root 下确实读不了（root 无权限概念，只查权限位）。
+    #    它刻意与一个同尺寸可读伴生文件共享 size，以便在阶段二被真实尝试读取并触发警告
+    #    （若其 size 全局唯一，会被哨兵短路、根本不读内容，警告路径无从验证）。
     unreadable = t.workdir / "A/secret.bin"
+    twin = t.workdir / "B/readable_twin.bin"
     assert unreadable.stat().st_mode & 0o777 == 0
+    assert unreadable.stat().st_size == twin.stat().st_size
     if os.geteuid() != 0:
         assert not os.access(unreadable, os.R_OK)
 
-    # 6. size 全局唯一文件：大小不与树内任何其他文件相同
+    # 6. size 全局唯一文件：大小不与树内任何其他文件相同（会被哨兵短路、不读内容）
     size_count = {}
     for state in t.snapshot().values():
         size_count[state[0]] = size_count.get(state[0], 0) + 1
-    for rel in ("A/unique_a.bin", "B/unique_b.bin", "A/secret.bin"):
+    for rel in ("A/unique_a.bin", "B/unique_b.bin"):
         size = (t.workdir / rel).stat().st_size
         assert size_count[size] == 1, f"{rel} 的 size {size} 不全局唯一"
 

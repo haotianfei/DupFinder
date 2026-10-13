@@ -138,27 +138,38 @@ INTERRUPTED_SUMMARY_RE = re.compile(
     r"skipped small/empty=(\d+) \(empty=(\d+)\), symlinks=(\d+), errors=(\d+)"
 )
 
-def _interrupted_run(t, sig, extra_args=(), settle=0.02):
-    """真实扫描模式启动子进程，读到第一条扫描里程碑日志后稍候发 `sig`。
+def _interrupted_run(t, sig, extra_args=()):
+    """真实扫描模式启动子进程，等阶段二的缓存首批批量写出现后再发 `sig`。
 
-    返回 (退出码, 收集到的 stderr 文本)。settle 保证信号落在扫描进行中：
-    4000 个 4KB 文件的扫描需数百毫秒，而信号在首条里程碑后约 20-45ms 送达。
+    两阶段扫描下阶段一（纯 stat 收集）不发生任何缓存落盘，缓存文件首次出现即
+    "已进入哈希阶段、首批已落盘、后续大批量仍在进行"的硬证据；此刻发信号保证
+    中断落在阶段二进行中，既不会早到无条目可落盘，也不会迟至进程收尾。
+    返回 (退出码, 收集到的 stderr 文本)。
     """
     proc = subprocess.Popen(
         [sys.executable, str(t.workdir / "dup_finder.py"), "-d", "A", "B", *extra_args],
         cwd=str(t.workdir), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
     lines = []
+    started = False
     signalled = False
+    deadline = time.monotonic() + 60
     assert proc.stderr is not None  # stderr=PIPE
     while True:
         line = proc.stderr.readline()
         if not line:
             break
         lines.append(line)
-        if not signalled and "Processing directory" in line:
-            time.sleep(settle)
-            proc.send_signal(sig)
+        if "Processing directory" in line:
+            started = True
+        if started and not signalled:
+            # 等首批缓存落盘出现（= 哈希阶段过半程证据），轮询而非固定 sleep，机器快慢自适应
+            while (not t.cache_path().exists() and proc.poll() is None
+                   and time.monotonic() < deadline):
+                time.sleep(0.002)
+            time.sleep(0.01)
+            if proc.poll() is None:
+                proc.send_signal(sig)
             signalled = True
     rc = proc.wait(timeout=120)
     return rc, "".join(lines)
@@ -192,8 +203,8 @@ def _assert_interruption_contract(t, sig, total):
 
 
 def test_sigint_flushes_partial_cache_once_and_exits_nonzero(dup_tree):
-    """SIGINT：锁内受控落盘一次（默认批量阈值下首条批量写之前即中断，落盘只可能来自
-    中断处理路径）、非零退出码、无 traceback、缓存为已处理条目的完整 JSON 快照、
+    """SIGINT 落在哈希阶段中段（首批批量写已落盘、后续批次仍在进行）：锁内受控
+    补盘一次、非零退出码、无 traceback、缓存为已处理条目的完整 JSON 快照、
     不产出结果文件、不触碰任何源文件。"""
     t = dup_tree
     total = _add_pair_files(t, 2000)  # 4000 文件
