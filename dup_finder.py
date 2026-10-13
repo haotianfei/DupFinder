@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import stat
 import shutil
 import hashlib
 import tempfile
@@ -45,33 +46,44 @@ def load_cache(cache_file):
         os.remove(cache_file)
         return {}
 
-def update_cache(cache, file_path, file_id):
-    """Update the cache with the file information."""
+def update_cache(cache, file_path, file_id, st=None):
+    """Update the cache with the file information.
+
+    Pass `st` (an os.stat_result already collected for this path) to reuse its
+    size/mtime, so each path is stat'ed only once per scan. The on-disk JSON
+    entry format is unchanged: {'file_id', 'modified_time', 'size'}.
+    """
+    if st is None:
+        st = os.stat(file_path)
     cache[file_path] = {
         'file_id': file_id,
-        'modified_time': os.path.getmtime(file_path),
-        'size': os.path.getsize(file_path)
+        'modified_time': st.st_mtime,
+        'size': st.st_size
     }
 
-def get_file_id(file_path, cache):
-    """Process a single file and return its file ID."""
-    # 检查文件路径是否指向一个普通文件
-    if not os.path.isfile(file_path):
-        logger.debug(f"Ignoring non-regular file: {file_path}")
-        return None
+def get_file_id(file_path, cache, st=None):
+    """Process a single file and return its file ID.
+
+    The cache hit check reuses the same stat snapshot (`st`) instead of extra
+    getmtime/getsize calls: when cached modified_time and size match the
+    snapshot, the cached file_id is returned as-is (no re-hash); otherwise the
+    hash is recomputed and the cache entry updated from the same snapshot.
+    Raises OSError (incl. PermissionError) for unreadable/vanished files, which
+    the caller handles per file.
+    """
+    if st is None:
+        st = os.stat(file_path)
 
     file_info = cache.get(file_path)
     if file_info:
         cached_modified_time = file_info.get('modified_time')
         cached_size = file_info.get('size')
-        current_modified_time = os.path.getmtime(file_path)
-        current_size = os.path.getsize(file_path)
 
-        if cached_modified_time == current_modified_time and cached_size == current_size:
+        if cached_modified_time == st.st_mtime and cached_size == st.st_size:
             return file_info['file_id']
 
     file_id = generate_file_identifier(file_path)
-    update_cache(cache, file_path, file_id)
+    update_cache(cache, file_path, file_id, st)
     return file_id
 
 def parse_exclude_file(exclude_file):
@@ -83,10 +95,27 @@ def parse_exclude_file(exclude_file):
         logger.error(f"Error reading exclude file {exclude_file}: {e}")
         return []
 
-def find_duplicates(directories, cache_file='file_cache.json', batch_size=10, exclude_keywords=None):
-    """Find duplicate files in the given directories."""
+def find_duplicates(directories, cache_file='file_cache.json', batch_size=10, exclude_keywords=None, min_size=1):
+    """Find duplicate files in the given directories.
+
+    Scan safety baseline:
+    - entries that are symlinks, or smaller than `min_size` bytes (0-byte files
+      are excluded with the default min_size=1), never become duplicate
+      candidates; they are counted and reported in a final summary line;
+    - a per-file OSError (e.g. unreadable or vanished mid-scan) yields exactly
+      one warning and the scan continues;
+    - each path is os.stat'ed once and the snapshot feeds cache comparison and
+      the result dict alike, avoiding multi-stat race windows.
+    Excluded files get no cache entries, so the existing cache file format and
+    all reusable entries stay untouched.
+    """
     lock_file = f"{cache_file}.lock"
     lock = FileLock(lock_file)
+
+    n_empty = 0
+    n_small = 0
+    n_symlink = 0
+    n_error = 0
 
     with lock:
         cache = load_cache(cache_file)
@@ -104,20 +133,37 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=10, ex
                     if exclude_keywords and any(keyword in file_path for keyword in exclude_keywords):
                         logger.debug(f"Excluding file: {file_path}")
                         continue
-                    file_id = get_file_id(file_path, cache)
-                    if not file_id:
-                        logger.error(f"Error generating file ID for {file_path}")
-                        continue
                     try:
-                        file_info = {
-                            'path': file_path,
-                            'size': os.path.getsize(file_path),  # File size in bytes
-                            'type': os.path.splitext(file_path)[1],
-                            'modified_time': os.path.getmtime(file_path)
-                        }
-                    except OSError as e:
+                        # 软链接条目不参与重复判定
+                        if os.path.islink(file_path):
+                            n_symlink += 1
+                            logger.debug("Skipping symlink: %s", file_path)
+                            continue
+                        # 单一路径一次 os.stat，size/mtime 快照贯穿缓存比对与结果字典
+                        st = os.stat(file_path)
+                        if not stat.S_ISREG(st.st_mode):
+                            logger.debug("Ignoring non-regular file: %s", file_path)
+                            continue
+                        # 小于阈值的文件（默认 min_size=1，即排除 0 字节文件）跳过
+                        if st.st_size < min_size:
+                            if st.st_size == 0:
+                                n_empty += 1
+                            n_small += 1
+                            logger.debug("Skipping file below min-size: %s", file_path)
+                            continue
+                        file_id = get_file_id(file_path, cache, st)
+                    except (OSError, PermissionError) as e:
+                        # 单个坏文件（不可读/中途消失等）只警告一次并继续整轮扫描
                         logger.warning(f"Error accessing file: {file_path} - {e}")
-                        continue  # 忽略该文件继续循环
+                        n_error += 1
+                        continue
+
+                    file_info = {
+                        'path': file_path,
+                        'size': st.st_size,
+                        'type': os.path.splitext(file_path)[1],
+                        'modified_time': st.st_mtime
+                    }
                     logger.debug("Process File ID: %s, File Info: %s", file_id, file_info)
 
                     if file_id in file_dict:
@@ -138,6 +184,11 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=10, ex
 
         # Filter out file_ids with only one element
         file_dict = {file_id: file_info_list for file_id, file_info_list in file_dict.items() if len(file_info_list) > 1}
+
+    logger.info(
+        "Scan summary: skipped small/empty=%d (empty=%d), symlinks=%d, errors=%d",
+        n_small, n_empty, n_symlink, n_error
+    )
 
     return file_dict
 
@@ -261,7 +312,7 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None):
                     logger.info(f"Renamed: {file['path']} to {new_path}")
                 except Exception as e:
                     logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
-def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None):
+def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1):
     if file_dict_path:
         # 从指定文件中加载 file_dict
         with open(file_dict_path, 'r') as f:
@@ -269,7 +320,7 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
         logger.info(f"Loaded file_dict from {file_dict_path}")
     else:
         # 找到重复文件
-        file_dict = find_duplicates(directories, exclude_keywords=exclude_keywords)
+        file_dict = find_duplicates(directories, exclude_keywords=exclude_keywords, min_size=min_size)
         assign_priorities(file_dict, retain_keywords, priority_order=priority_order)
         # 保存 file_dict 到文件
         current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -287,6 +338,10 @@ if __name__ == "__main__":
     parser.add_argument("--priority-order", "-p", nargs='+', required=False, help="Custom priority order: default is modified_time, path")
     parser.add_argument("--move-to-dir", "-m", required=False, help="Directory to move files to (if not specified, rename files with .dup_finder suffix)")
     parser.add_argument("--try-run", "-n", action='store_true', required=False, help="Try run mode: only print actions without executing them")
+    parser.add_argument("--min-size", type=int, default=1, required=False,
+                        help="Minimum file size in bytes to participate in duplicate detection; "
+                             "files smaller than this (including 0-byte files, by default) are "
+                             "skipped during scanning and counted in the scan summary (default: 1)")
     # 添加 exclude 和 exclude-file 参数
     parser.add_argument("--exclude", nargs='+', required=False, help="Exclude files use keywords, ")
     parser.add_argument("--exclude-file", required=False, help="File containing exclude keywords, one per line")
@@ -310,7 +365,7 @@ if __name__ == "__main__":
     if args.retain_file:
         retain_keywords_from_file = parse_exclude_file(args.retain_file)  # 使用 parse_exclude_file 函数读取 retain-file
         retain_keywords.extend(retain_keywords_from_file)
-    main(args.directories, args.action, args.priority_order, args.move_to_dir, args.try_run, exclude_keywords=exclude_keywords, retain_keywords=retain_keywords, file_dict_path=args.duplicates_result_file)
+    main(args.directories, args.action, args.priority_order, args.move_to_dir, args.try_run, exclude_keywords=exclude_keywords, retain_keywords=retain_keywords, file_dict_path=args.duplicates_result_file, min_size=args.min_size)
 
 
 
