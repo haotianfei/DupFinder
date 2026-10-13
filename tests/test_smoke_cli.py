@@ -37,6 +37,7 @@ def test_help_lists_every_existing_flag(dup_tree):
         "--retain-file",
         "--duplicates-result-file",
         "--undo",
+        "--export-candidates",
     ):
         assert opt in out, f"help 缺少既有参数 {opt}"
     for short in ("-d", "-p", "-m", "-n"):

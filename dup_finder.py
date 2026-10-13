@@ -140,6 +140,39 @@ def parse_exclude_file(exclude_file):
         logger.error(f"Error reading exclude file {exclude_file}: {e}")
         return []
 
+
+# 同步文件夹标记：扫描根直接子项中名字以下列前缀开头的条目（标记本体及其变体
+# 后缀都能覆盖）。只用于警示识别，不参与任何过滤或决策。
+SYNC_FOLDER_MARKER_PREFIXES = (".stfolder", ".sync")
+
+
+def find_sync_marker(directory: str) -> str | None:
+    """Return the name of the first sync-folder marker among the direct entries
+    of a scan root, or None when there is no marker / the listing fails."""
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.startswith(SYNC_FOLDER_MARKER_PREFIXES):
+            return entry
+    return None
+
+
+def warn_if_sync_marker(directory: str) -> None:
+    """Warn (never block) when a scan root looks like an active synchronized folder.
+
+    move/delete actions inside such directories propagate to the other devices
+    sharing the folder, so the operator sees this before the action phase.
+    """
+    marker = find_sync_marker(directory)
+    if marker:
+        logger.warning(
+            "Scan root %s appears to be an active synchronized folder (marker %s): "
+            "move/delete actions will propagate to peer devices.",
+            directory, marker
+        )
+
 def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, exclude_keywords=None, min_size=1, try_run=False, cross_dirs_only=False):
     """Find duplicate files in the given directories.
 
@@ -230,6 +263,7 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
             for directory in directories:
                 n_dirs_scanned += 1
                 logger.info("Processing directory: %s", directory)
+                warn_if_sync_marker(directory)
                 for root, _, files in os.walk(directory):
                     for file in files:
                         # 每个文件开头检查一次待处理信号（安全点，粒度为单文件，响应为毫秒级）
@@ -499,18 +533,53 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
                 priority_counter += 1
 
 
-def retain_files(file_dict, action, move_to_dir=None, try_run=False, manifest=None):
-    """Retain files based on the priority and process the rest."""
+def select_files_for_processing(file_dict) -> list:
+    """Return [(file_id, file_info), ...] in the exact order and set retain_files acts on.
+
+    Selection rule (unchanged from the action phase itself): within each
+    duplicate group, files are ordered by priority ascending; the lowest
+    priority value is the retained baseline and every file with a strictly
+    higher (worse) priority number joins the processing queue. Shared by
+    retain_files and the candidate-list export so the exported list cannot
+    drift from what actually gets processed.
+    """
+    queue = []
     for file_id, files in file_dict.items():
-        # Sort files by priority (lowest priority number first)
         files.sort(key=lambda x: x['priority'])
-        # Find the highest priority (lowest priority number)
         highest_priority = files[0]['priority']
-        
-        # Process files with priority higher than the highest retained priority
         for file in files:
             if file['priority'] > highest_priority:
-                process_file(file, action, move_to_dir, try_run, file_id, manifest)
+                queue.append((file_id, file))
+    return queue
+
+
+def export_candidates(paths, out_path: str) -> bool:
+    """Write the pending-processing list, one absolute source path per line.
+
+    Pure output of the already-decided processing queue (cross-root filtering,
+    retain keywords and priority selection have all run beforehand); it changes
+    no selection itself. Missing parent directories of out_path are created.
+    Returns True on success; on failure logs the error and returns False, and
+    the caller stops before any action so a requested review artifact is never
+    silently missing.
+    """
+    absolute_out = os.path.abspath(out_path)
+    try:
+        os.makedirs(os.path.dirname(absolute_out), exist_ok=True)
+        with open(absolute_out, "w") as out_file:
+            for path in paths:
+                out_file.write(os.path.abspath(path) + "\n")
+    except OSError as e:
+        logger.error("Cannot write candidate list to %s: %s", out_path, e)
+        return False
+    logger.info("Candidate list exported: %s (%d file(s))", out_path, len(paths))
+    return True
+
+
+def retain_files(file_dict, action, move_to_dir=None, try_run=False, manifest=None):
+    """Retain files based on the priority and process the rest."""
+    for file_id, file in select_files_for_processing(file_dict):
+        process_file(file, action, move_to_dir, try_run, file_id, manifest)
 
 
 # def check_filename_length(filename):
@@ -584,7 +653,7 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, ma
                     logger.info(f"Renamed: {file['path']} to {new_path}")
                 except Exception as e:
                     logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
-def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False, undo=None):
+def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False, undo=None, export_candidates_path=None):
     if undo is not None:
         # --undo 与扫描互斥：只按清单反向恢复，不扫描、不读缓存、不产结果文件
         manifests = collect_move_manifests(undo)
@@ -632,6 +701,13 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
             with open(output_file, 'w') as f:
                 json.dump(file_dict, f, indent=4)
             logger.info(f"Saved file_dict to {output_file}")
+
+    # 待处理候选清单：在处理队列确定（cross-dirs 过滤 + retain/优先级选择）之后、
+    # 任何动作执行之前导出；写失败则停止，绝不带着未审查的清单继续执行
+    if export_candidates_path is not None:
+        pending_paths = [file_info['path'] for _file_id, file_info in select_files_for_processing(file_dict)]
+        if not export_candidates(pending_paths, export_candidates_path):
+            sys.exit(1)
 
     retain_files(file_dict, action, move_to_dir, try_run, manifest)
     if manifest is not None:
@@ -809,6 +885,17 @@ if __name__ == "__main__":
                              "under the recycle dir, and prints a restored/skipped/missing/total "
                              "count summary at the end. Mutually exclusive with -d/--directories. "
                              "Example: dup_finder.py --undo trash")
+    # 添加导出待处理候选清单参数
+    parser.add_argument("--export-candidates", required=False, metavar="PATH",
+                        help="Before any action runs, write the list of files that will be "
+                             "processed to PATH, one absolute source path per line, matching "
+                             "exactly the selected processing queue (after cross-root filtering "
+                             "and priority/retain selection). Works with delete, move or "
+                             "--try-run; combine with --try-run to only review the list, since "
+                             "try-run still writes no cache, result or manifest files. The "
+                             "output file is a user-requested artifact; its parent directories "
+                             "are created as needed, and the run stops before acting if the "
+                             "list cannot be written.")
 
     args = parser.parse_args()
     # --undo 与扫描参数互斥：恢复模式不要求 -d，也不做扫描/缓存/结果文件任何动作
@@ -835,7 +922,7 @@ if __name__ == "__main__":
              exclude_keywords=exclude_keywords, retain_keywords=retain_keywords,
              file_dict_path=args.duplicates_result_file, min_size=args.min_size,
              cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only,
-             undo=args.undo)
+             undo=args.undo, export_candidates_path=args.export_candidates)
     except CacheInterrupted:
         # 扫描循环已在锁内完成一次受控落盘；此处只做非零码干净退出，不打印 traceback
         sys.exit(1)
