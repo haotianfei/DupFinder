@@ -305,14 +305,25 @@ class DupTree:
 
     def run(self, *args):
         """在 workdir 里以子进程运行脚本副本——唯一进入被测系统的方式。"""
+        return self.run_script("dup_finder.py", *args)
+
+    def run_script(self, script_name, *args):
+        """运行 workdir 内指定脚本副本（dup_finder.py / change_priority.py 等）。"""
         cmd = [
             sys.executable,
-            str(self.workdir / "dup_finder.py"),
+            str(self.workdir / script_name),
             *args,
         ]
         return subprocess.run(
             cmd, cwd=str(self.workdir), capture_output=True, text=True, timeout=180
         )
+
+    def copy_in(self, script_name):
+        """把仓库根某个脚本副本拷进 workdir（保留元数据），供需要它的用例调用。"""
+        dest = self.workdir / script_name
+        if not dest.exists():
+            shutil.copy2(str(REPO_ROOT / script_name), str(dest))
+        return dest
 
     def run_scan(self, *extra_args):
         """默认扫描：-d A B --try-run（演练，不动源文件）。"""

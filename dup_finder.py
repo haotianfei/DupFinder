@@ -430,6 +430,56 @@ def scan_root_components(directories: list[str]) -> list[list[str]]:
     return [split_path_components(os.path.abspath(directory)) for directory in directories]
 
 
+# 结果文件结构校验：消费（cross-dirs 裁剪 / 优先级选择 / 动作执行）之前的前置守卫。
+# 选择"报错退出"而非"自动补排"：载入的语义是尊重文件里既有的优先级决定，
+# 静默重排会改变使用者的意图；结构不合法时必须零动作把问题逐条讲清楚。
+RESULT_SCHEMA_PROBLEM_LIMIT = 20
+
+
+def validate_result_schema(data) -> list:
+    """Return human-readable problems found in a loaded duplicates-result structure.
+
+    Requirements: top level is a dict of group-key -> list of entry dicts; every
+    entry carries a str 'path' and an int 'priority' (bool is rejected although
+    it is an int subclass). An empty list means the structure is consumable.
+    """
+    if not isinstance(data, dict):
+        return [f"top level must be an object mapping group keys to entry lists, "
+                f"got {type(data).__name__}"]
+    problems = []
+    for group_key, entries in data.items():
+        if not isinstance(entries, list):
+            problems.append(f"group {group_key!r}: value must be a list of entries, "
+                            f"got {type(entries).__name__}")
+            continue
+        for index, entry in enumerate(entries):
+            location = f"group {group_key!r} entry #{index}"
+            if not isinstance(entry, dict):
+                problems.append(f"{location}: entry must be an object, "
+                                f"got {type(entry).__name__}")
+                continue
+            path = entry.get("path")
+            if not isinstance(path, str):
+                problems.append(f"{location}: field 'path' missing or not a string")
+            priority = entry.get("priority")
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                problems.append(f"{location} (path={path!r}): "
+                                f"field 'priority' missing or not an integer")
+    return problems
+
+
+def report_result_schema_problems(problems, source) -> None:
+    """Log schema problems one per line, capped at RESULT_SCHEMA_PROBLEM_LIMIT,
+    with the full total always stated."""
+    logger.error("Invalid duplicates result file %s: %d problem(s) found",
+                 source, len(problems))
+    for problem in problems[:RESULT_SCHEMA_PROBLEM_LIMIT]:
+        logger.error("  - %s", problem)
+    if len(problems) > RESULT_SCHEMA_PROBLEM_LIMIT:
+        logger.error("  ... and %d more problem(s) not listed",
+                     len(problems) - RESULT_SCHEMA_PROBLEM_LIMIT)
+
+
 def attribute_path_to_root(file_path: str, roots: list[list[str]]) -> int | None:
     """Index of the scan root that owns `file_path`, or None if under no root.
 
@@ -502,11 +552,14 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
         # 检查同一 file_id 下的文件大小是否一致
         file_sizes = {file['size'] for file in files}
         if len(file_sizes) > 1:
-            # 如果文件大小不一致，将所有文件的优先级设置为 0
+            # 哈希一致但大小不同：极罕见的摘要碰撞情形，不是故障——
+            # 整组全部保留（priority 0），交给使用者人工甄别
             for file_info in files:
                 file_info['priority'] = 0
-            # 打印文件大小不一致的 file_id 及文件列表
-            logger.error("File ID with inconsistent sizes: %s", file_id)
+            logger.warning(
+                "Same digest with differing sizes (hash collision is rare, not fatal); "
+                "all files in this group are kept for manual review: %s", file_id
+            )
             for file_info in files:
                 logger.warning(f"  Path: {file_info['path']}, Size: {file_info['size']}")
             continue
@@ -679,6 +732,11 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
         # 从指定文件中加载 file_dict
         with open(file_dict_path, 'r') as f:
             file_dict = json.load(f)
+        # 前置守卫：结构不合法则逐条报错并退出，绝不带着坏数据进入裁剪/选择/动作阶段
+        problems = validate_result_schema(file_dict)
+        if problems:
+            report_result_schema_problems(problems, file_dict_path)
+            sys.exit(1)
         logger.info(f"Loaded file_dict from {file_dict_path}")
         if cross_dirs_only:
             # 载入的历史结果同样按本次传入的扫描根做跨目录专属裁剪
