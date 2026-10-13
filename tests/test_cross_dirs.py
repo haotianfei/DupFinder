@@ -10,7 +10,7 @@
 
 import hashlib
 
-from conftest import console_output
+from conftest import console_output, moved_payload_files
 
 CROSS_CONTENT = b"cross-payload-" * 100     # 1400B：跨 A/B 根的重复对
 INT_A_CONTENT = b"internal-a-" * 100        # A 根内部重复对
@@ -90,7 +90,7 @@ def test_cross_flag_processes_only_cross_root_group(dup_tree):
         t.assert_file_unchanged(rel, before)
 
     # trash 里只有那一个被移动的跨根成员
-    moved_files = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved_files = moved_payload_files(t.workdir / "trash")
     assert len(moved_files) == 1
     assert moved_files[0].name in ("xover.txt", "b-over.txt")
 
@@ -125,7 +125,7 @@ def test_cross_flag_with_retain_component_keeps_a_side_untouched(dup_tree):
     # 唯一被移走的是 B 侧跨根副本（A 侧成员被 dirA 分量关键字保留）
     moved = _moved_lines(out)
     assert len(moved) == 1 and "B/b-over.txt" in moved[0], out
-    moved_files = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved_files = moved_payload_files(t.workdir / "trash")
     assert [p.name for p in moved_files] == ["b-over.txt"]
 
     # A 侧全量文件：mtime + 内容 + 权限逐字段与运行前一致（只读不动）
@@ -217,7 +217,7 @@ def test_sibling_roots_attribution_does_not_leak_between_A_and_A_nm(dup_tree):
     # 跨根组处理：A-nm/y1.txt 被移走（A 侧 x1.txt 由分量关键字保留）
     moved = _moved_lines(out)
     assert len(moved) == 1 and "A-nm/y1.txt" in moved[0], out
-    moved_files = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved_files = moved_payload_files(t.workdir / "trash")
     assert [p.name for p in moved_files] == ["y1.txt"]
 
     # A-nm 内部组（y2/y3）整组零触碰；A/x1 保留

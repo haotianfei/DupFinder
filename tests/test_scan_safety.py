@@ -11,7 +11,7 @@ import re
 import stat
 
 import pytest
-from conftest import console_output
+from conftest import console_output, moved_payload_files
 
 
 def _sha(data):
@@ -167,7 +167,7 @@ def test_empty_and_symlink_untouched_under_move(full_tree):
         remaining = [rel for rel in pair if (t.workdir / rel).exists()]
         assert len(remaining) == 1, f"移动组应恰好保留 1 个文件，实际: {remaining}"
 
-    moved_files = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved_files = moved_payload_files(t.workdir / "trash")
     assert len(moved_files) == 2
     assert all(p.name not in ("empty.bin", "sym_link.txt", "secret.bin") for p in moved_files)
 
@@ -347,5 +347,5 @@ def test_warm_cache_reused_without_rehash(dup_tree_factory):
 
     after = json.loads(t.cache_path().read_text())
     assert all(v["file_id"] == sentinel for v in after.values()), "缓存条目被重算覆盖"
-    moved = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved = moved_payload_files(t.workdir / "trash")
     assert len(moved) == 1

@@ -60,6 +60,22 @@ def console_output(proc):
     """
     return (proc.stdout or "") + (proc.stderr or "")
 
+
+MANIFEST_PREFIX = "moves_"
+
+
+def is_move_manifest(path) -> bool:
+    """是否 move 运行写在回收目录根部的 JSONL 清单文件。"""
+    return path.name.startswith(MANIFEST_PREFIX) and path.suffix == ".jsonl"
+
+
+def moved_payload_files(directory):
+    """回收目录内被真正移动过来的负载文件（排除 moves_*.jsonl 清单与 .tmp 残留）。"""
+    return sorted(
+        p for p in Path(directory).rglob("*")
+        if p.is_file() and not is_move_manifest(p) and p.suffix != ".tmp"
+    )
+
 # 各场景内容长度：0（两个空文件）与刻意成对的重复内容之外，其余全局唯一。
 LEN_CROSS = 1000       # 跨目录重复对共享大小
 LEN_INDIR = 2000       # 目录内部重复对共享大小

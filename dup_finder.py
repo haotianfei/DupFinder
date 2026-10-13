@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import glob
 import stat
 import shutil
 import signal
@@ -498,7 +499,7 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
                 priority_counter += 1
 
 
-def retain_files(file_dict, action, move_to_dir=None, try_run=False):
+def retain_files(file_dict, action, move_to_dir=None, try_run=False, manifest=None):
     """Retain files based on the priority and process the rest."""
     for file_id, files in file_dict.items():
         # Sort files by priority (lowest priority number first)
@@ -509,7 +510,7 @@ def retain_files(file_dict, action, move_to_dir=None, try_run=False):
         # Process files with priority higher than the highest retained priority
         for file in files:
             if file['priority'] > highest_priority:
-                process_file(file, action, move_to_dir, try_run, file_id)
+                process_file(file, action, move_to_dir, try_run, file_id, manifest)
 
 
 # def check_filename_length(filename):
@@ -518,7 +519,7 @@ def retain_files(file_dict, action, move_to_dir=None, try_run=False):
 #     return byte_length <= 255
 
 
-def process_file(file, action, move_to_dir=None, try_run=False, file_id=None):
+def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, manifest=None):
     # 操作类型校验
     if action not in ['delete', 'move']:
         logger.warning(f"Unsupported action: {action}. Skipping file: {file['path']}")
@@ -568,6 +569,9 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None):
                 try:
                     shutil.move(file['path'], new_path)
                     logger.info(f"Moved: {file['path']} to {new_path}")
+                    # 每条实际成功的移动即时写入 JSONL 清单（rename 模式无回收目录，不产清单）
+                    if manifest is not None:
+                        manifest.record(file['path'], new_path)
                 except Exception as e:
                     logger.error(f"Error moving {file['path']} to {new_path}: {e}")
         else:
@@ -580,7 +584,28 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None):
                     logger.info(f"Renamed: {file['path']} to {new_path}")
                 except Exception as e:
                     logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
-def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False):
+def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False, undo=None):
+    if undo is not None:
+        # --undo 与扫描互斥：只按清单反向恢复，不扫描、不读缓存、不产结果文件
+        manifests = collect_move_manifests(undo)
+        if not manifests:
+            logger.error("Undo target has no moves_*.jsonl manifest to replay: %s", undo)
+            sys.exit(1)
+        counts = undo_moves(manifests)
+        logger.info(
+            "Undo summary: restored=%d skipped_conflict=%d missing=%d total=%d",
+            counts["restored"], counts["skipped_conflict"],
+            counts["missing"], counts["total"]
+        )
+        return
+
+    manifest = None
+    if action == 'move' and move_to_dir and not try_run:
+        # 清单落在回收目录根部，随数据自包含；rename 模式（无 -m）与演练/删除不产清单
+        # 微秒粒度：同秒多次运行各自产出独立清单
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        manifest = MoveManifest(os.path.join(move_to_dir, f"moves_{current_time}.jsonl"))
+
     if file_dict_path:
         # 从指定文件中加载 file_dict
         with open(file_dict_path, 'r') as f:
@@ -608,11 +633,146 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
                 json.dump(file_dict, f, indent=4)
             logger.info(f"Saved file_dict to {output_file}")
 
-    retain_files(file_dict, action, move_to_dir, try_run)
+    retain_files(file_dict, action, move_to_dir, try_run, manifest)
+    if manifest is not None:
+        manifest.log_summary()
+
+
+class MoveManifest:
+    """JSONL manifest of actually-successful moves, living at the recycle-dir root.
+
+    One {\"src\": ..., \"dst\": ...} line per successful move, appended with the
+    absolute paths and flushed immediately, so a process dying mid-run still
+    leaves every completed entry on disk. A write failure only warns and is
+    counted; it never aborts the run. The file itself is created lazily on the
+    first recorded move, so runs without successful moves leave no manifest.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.entries = 0
+        self.write_failures = 0
+
+    def record(self, src: str, dst: str) -> None:
+        entry = {"src": os.path.abspath(src), "dst": os.path.abspath(dst)}
+        try:
+            with open(self.path, "a") as manifest_file:
+                manifest_file.write(json.dumps(entry) + "\n")
+                manifest_file.flush()
+            self.entries += 1
+        except OSError as e:
+            self.write_failures += 1
+            logger.warning(f"Failed to record move {src} -> {dst} in manifest: {e}")
+
+    def log_summary(self) -> None:
+        if self.entries:
+            logger.info("Move manifest: %s (%d entries)", self.path, self.entries)
+        if self.write_failures:
+            logger.warning("Move manifest write failures: %d", self.write_failures)
+
+
+def collect_move_manifests(target: str) -> list[str]:
+    """Resolve a --undo target into manifest files.
+
+    A directory contributes every moves_*.jsonl directly inside it; a file path
+    is taken as a single manifest. Returns an empty list when nothing matches.
+    """
+    if os.path.isdir(target):
+        return sorted(glob.glob(os.path.join(target, "moves_*.jsonl")))
+    if os.path.isfile(target):
+        return [target]
+    return []
+
+
+def prune_empty_dirs_under(boundary: str, start_paths) -> None:
+    """Delete directories that became empty inside the recycle dir, bottom-up.
+
+    Walks from each start directory upward but stops at the boundary (the
+    recycle-dir root): the boundary itself is never removed and nothing outside
+    it is ever touched.
+    """
+    boundary = os.path.abspath(boundary)
+    for start in start_paths:
+        current = os.path.abspath(start)
+        while current.startswith(boundary + os.sep):
+            try:
+                os.rmdir(current)  # only removes truly empty dirs
+            except OSError:
+                break  # non-empty or vanished: stop climbing this branch
+            current = os.path.dirname(current)
+
+
+def undo_moves(manifest_paths: list[str]) -> dict:
+    """Restore recorded moves by replaying every {src, dst} entry in reverse.
+
+    Rules (mirroring the battle-tested manual recovery procedure): an existing
+    path at src is never overwritten (counted as skipped_conflict, the new
+    data stays), a dst that no longer exists is counted as missing, and missing
+    parent directories of src are recreated before restoring. shutil.move is
+    used exactly like the forward move, so permissions and timestamps survive
+    (same-device rename; cross-device falls back to copy2 + delete). Empty
+    directory skeletons inside the recycle dir are pruned afterwards.
+    Returns counts {\"restored\", \"skipped_conflict\", \"missing\", \"total\"}.
+    """
+    counts = {"restored": 0, "skipped_conflict": 0, "missing": 0, "total": 0}
+    prune_starts: dict[str, set] = {}
+
+    for manifest_path in manifest_paths:
+        boundary = os.path.dirname(os.path.abspath(manifest_path))
+        starts = prune_starts.setdefault(boundary, set())
+        with open(manifest_path, "r") as f:
+            for line_number, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        raise ValueError("manifest line is not a JSON object")
+                    src = entry["src"]
+                    dst = entry["dst"]
+                except (ValueError, KeyError) as e:
+                    logger.warning(
+                        "Malformed manifest entry at %s:%d, skipped: %s",
+                        manifest_path, line_number, e
+                    )
+                    continue
+
+                counts["total"] += 1
+                starts.add(os.path.dirname(os.path.abspath(dst)))
+
+                if os.path.lexists(src):
+                    # 原位已被占用：绝不覆盖，保护回滚期间新产生的数据
+                    counts["skipped_conflict"] += 1
+                    logger.warning(
+                        "Undo: original location already occupied, keeping it and "
+                        "leaving %s in place: %s", dst, src
+                    )
+                    continue
+                if not os.path.lexists(dst):
+                    counts["missing"] += 1
+                    logger.warning("Undo: recorded destination no longer exists: %s", dst)
+                    continue
+
+                parent = os.path.dirname(os.path.abspath(src))
+                os.makedirs(parent, exist_ok=True)
+                try:
+                    shutil.move(dst, src)
+                    counts["restored"] += 1
+                    logger.info("Restored: %s to %s", dst, src)
+                except Exception as e:
+                    logger.error("Error restoring %s to %s: %s", dst, src, e)
+
+    for boundary, starts in prune_starts.items():
+        prune_empty_dirs_under(boundary, starts)
+
+    return counts
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and process duplicate files.")
-    parser.add_argument("--directories", "-d", nargs='+', required=True, help="Directories to search for duplicate files")
+    parser.add_argument("--directories", "-d", nargs='+', required=False,
+                        help="Directories to search for duplicate files "
+                             "(required unless --undo is used)")
     parser.add_argument("--action", choices=['delete', 'move'], required=False, default='move', help="Action to process files (default: move)")
     parser.add_argument("--priority-order", "-p", nargs='+', required=False, help="Custom priority order: default is modified_time, path")
     parser.add_argument("--move-to-dir", "-m", required=False, help="Directory to move files to (if not specified, rename files with .dup_finder suffix)")
@@ -640,8 +800,23 @@ if __name__ == "__main__":
     parser.add_argument("--retain-file", required=False, help="File containing retain keywords, one per line")
     # 添加 duplicates-result-file 参数
     parser.add_argument("--duplicates-result-file", required=False, help="File containing the duplicates result JSON data")
+    # 添加 undo 参数（与扫描互斥的恢复模式）
+    parser.add_argument("--undo", required=False, metavar="PATH",
+                        help="Rollback mode: replay a moves_*.jsonl manifest (a file path, or a "
+                             "directory containing them) and move each recorded file from its "
+                             "destination back to its original source. Never overwrites a source "
+                             "location that is already occupied, prunes emptied directory skeletons "
+                             "under the recycle dir, and prints a restored/skipped/missing/total "
+                             "count summary at the end. Mutually exclusive with -d/--directories. "
+                             "Example: dup_finder.py --undo trash")
 
     args = parser.parse_args()
+    # --undo 与扫描参数互斥：恢复模式不要求 -d，也不做扫描/缓存/结果文件任何动作
+    if args.undo:
+        if args.directories:
+            parser.error("--undo rollback mode cannot be combined with -d/--directories")
+    elif not args.directories:
+        parser.error("the following arguments are required: --directories/-d (or use --undo PATH)")
     # 使用 subprocess.list2cmdline 重建命令行字符串
     command_line = subprocess.list2cmdline(sys.argv)
     logger.info("Full command line: %s", command_line)
@@ -659,7 +834,8 @@ if __name__ == "__main__":
         main(args.directories, args.action, args.priority_order, args.move_to_dir, args.try_run,
              exclude_keywords=exclude_keywords, retain_keywords=retain_keywords,
              file_dict_path=args.duplicates_result_file, min_size=args.min_size,
-             cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only)
+             cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only,
+             undo=args.undo)
     except CacheInterrupted:
         # 扫描循环已在锁内完成一次受控落盘；此处只做非零码干净退出，不打印 traceback
         sys.exit(1)

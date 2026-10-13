@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from conftest import console_output
+from conftest import console_output, moved_payload_files
 
 TRAP_CONTENT = b"trap-content" * 100  # 1200B：三成员同内容同 size，落入同一重复组
 
@@ -90,7 +90,7 @@ def test_retain_dir_component_move_takes_only_sibling_decoy(dup_tree):
     t.assert_file_unchanged("A/dirA/keep.txt", before)
     t.assert_file_unchanged("A/dirA/nested/inner.txt", before)
 
-    moved_files = [p for p in (t.workdir / "trash").rglob("*") if p.is_file()]
+    moved_files = moved_payload_files(t.workdir / "trash")
     assert [p.name for p in moved_files] == ["decoy.txt"]
 
 
