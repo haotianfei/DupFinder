@@ -346,8 +346,48 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
 
     return file_dict
 
+def split_path_components(path: str) -> list[str]:
+    """Split a path into its directory/filename components.
+
+    Both POSIX and Windows separators are normalized before splitting and
+    empty components (leading or repeated separators) are dropped, so
+    '/a/b', 'a/b' and 'a\\\\b' all yield the same component sequence.
+    """
+    return [component for component in path.replace("\\", "/").split("/") if component]
+
+
+def path_matches_keyword(path: str, keyword: str) -> bool:
+    """Component-aware keyword matching (replaces the old bare-substring rule).
+
+    The keyword's component sequence matches when it occurs as a contiguous
+    run of the path's components: a single-component keyword must equal one
+    whole component; a multi-component keyword must align with consecutive
+    components. Trailing separators on the keyword are ignored, so 'dirA' and
+    'dirA/' behave identically. Because whole components are compared, 'dirA'
+    matches files under the directory component 'dirA' but never a sibling
+    named 'dirA-nm' — the bare substring rule matched both, which is how
+    adjacent directories with a shared name prefix used to be caught in the
+    same net. An empty keyword matches nothing.
+    """
+    keyword_components = split_path_components(keyword)
+    if not keyword_components:
+        return False
+    path_components = split_path_components(path)
+    width = len(keyword_components)
+    return any(
+        path_components[start:start + width] == keyword_components
+        for start in range(len(path_components) - width + 1)
+    )
+
+
 def assign_priorities(file_dict, retain_keywords, priority_order=None):
-    """Assign priorities to files based on the given criteria."""
+    """Assign priorities to files based on the given criteria.
+
+    Retain keywords and the 'path' priority field share the same component
+    machinery: keyword hits are decided by path_matches_keyword (contiguous
+    whole components, separator-style normalized), and the path sort depth is
+    measured in normalized components via split_path_components.
+    """
     if priority_order is None:
         # Default priority order
         priority_order = ['modified_time', 'path']
@@ -369,15 +409,18 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
         files.sort(
             key=lambda x: tuple(
                 x[order] if order == 'modified_time'  # 修改时间字段升序排列
-                else (-x[order] if order != 'path'  # 其他数值字段降序排列
-                      else -x[order].count(os.sep))  # 路径字段按目录深度降序
+                else (-len(split_path_components(x[order]))  # 路径字段按分量深度降序
+                      if order == 'path'               # （斜杠风格归一，与关键字匹配共用分量切分）
+                      else -x[order])                  # 其他数值字段降序排列
                 for order in priority_order
             )
         )
         # Assign priorities to all files
         for file_info in files:
-            # 检查文件路径是否包含 retain_keywords
-            if retain_keywords and any(keyword in file_info['path'] for keyword in retain_keywords):
+            # 保留关键字按路径分量匹配（连续整分量序列；见 path_matches_keyword）
+            if retain_keywords and any(
+                    path_matches_keyword(file_info['path'], keyword)
+                    for keyword in retain_keywords):
                 file_info['priority'] = 0
             else:
                 file_info['priority'] = priority_counter
