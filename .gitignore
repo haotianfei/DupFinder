@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+logs/
+out/
+file_cache.json
+file_cache.json.lock
+duplicates_*.json
+.pytest_cache/
+.venv/
