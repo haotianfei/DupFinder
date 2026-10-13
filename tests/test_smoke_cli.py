@@ -30,6 +30,8 @@ def test_help_lists_every_existing_flag(dup_tree):
         "--try-run",
         "--min-size",
         "--cache-batch",
+        "--hash-algo",
+        "--min-free-percent",
         "--cross-dirs-only",
         "--exclude",
         "--exclude-file",

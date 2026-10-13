@@ -10,7 +10,7 @@
 
 import hashlib
 
-from conftest import console_output, moved_payload_files
+from conftest import console_lines_with, console_output, moved_payload_files
 
 CROSS_CONTENT = b"cross-payload-" * 100     # 1400B：跨 A/B 根的重复对
 INT_A_CONTENT = b"internal-a-" * 100        # A 根内部重复对
@@ -58,7 +58,7 @@ def _group_paths(data):
 
 
 def _moved_lines(console_text):
-    return [ln for ln in console_text.splitlines() if "Moved:" in ln]
+    return console_lines_with(console_text, "Moved:")
 
 
 # ---------------------------------------------------------------------------

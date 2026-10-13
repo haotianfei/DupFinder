@@ -10,11 +10,38 @@ import tempfile
 import argparse
 import subprocess
 import datetime
+import time
+from collections.abc import Iterable
+from typing import Any
 from filelock import FileLock
 from logger import configure_logger
+from pathlogic import (
+    RESULT_SCHEMA_PROBLEM_LIMIT,
+    path_matches_keyword,
+    split_path_components,
+    validate_result_schema,
+)
 
 
 logger = configure_logger("DupFinder")
+
+
+# ---------------------------------------------------------------------------
+# 集中可调的运行参数（默认值即历史魔法值，行为零变化）
+# ---------------------------------------------------------------------------
+DEFAULT_HASH_ALGO = "sha256"          # 既有缓存条目全部为该算法的裸 hex 摘要
+HASH_ALGO_CHOICES = ("sha256", "sha512", "sha1", "md5", "blake2b", "blake2s")
+DEFAULT_CACHE_BATCH = 2000            # 哈希缓存批量重写阈值（--cache-batch）
+DEFAULT_MIN_SIZE = 1                  # 参与去重的最小文件字节数（--min-size）
+PROGRESS_INTERVAL = 1000              # 每处理多少文件出一条 INFO 进度里程碑
+DEFAULT_MIN_FREE_PERCENT = 5.0        # 目标卷剩余空间低于该百分比时拒绝移动（--min-free-percent）
+# 说明：内容摘要统一走 hashlib.file_digest（C 层流式实现），其读取块缓冲由
+# 标准库内部固定、不对外暴露参数，此处不再伪造可调项。
+
+# 类型别名：分组结果 / 单条文件条目 / 哈希缓存
+FileEntry = dict[str, Any]
+FileDict = dict[str, list[FileEntry]]
+Cache = dict[str, dict[str, Any]]
 
 
 # 缓存哨兵：标记"文件大小全局唯一，未读内容、永不可能是重复项"。
@@ -37,23 +64,49 @@ class CacheInterrupted(Exception):
         self.signum = signum
 
 
-def get_file_hash(file_path, hash_algo=hashlib.sha256):
+def get_file_hash(file_path: str, hash_algo: str = DEFAULT_HASH_ALGO) -> str:
     """Calculate the hash of a file, digesting it as a stream via hashlib.file_digest.
 
-    `hash_algo` accepts an algorithm name string or a no-argument hashlib-style
-    constructor; the resulting hex digest is byte-for-byte identical to the
-    previous manual chunked update loop, so cached values stay compatible.
+    `hash_algo` is an algorithm name accepted by hashlib; the resulting hex
+    digest is byte-for-byte identical to the previous manual chunked update
+    loop, so cached values stay compatible.
     """
-    algorithm = hash_algo if isinstance(hash_algo, str) else hash_algo().name
     with open(file_path, 'rb') as f:
-        return hashlib.file_digest(f, algorithm).hexdigest()
+        return hashlib.file_digest(f, hash_algo).hexdigest()
 
-def generate_file_identifier(file_path):
+def generate_file_identifier(file_path: str, hash_algo: str = DEFAULT_HASH_ALGO) -> str:
     """Generate a unique identifier for a file."""
-    file_hash = get_file_hash(file_path, hashlib.sha256)
+    file_hash = get_file_hash(file_path, hash_algo)
     return file_hash
 
-def write_cache_to_file(cache, cache_file):
+
+def encode_cached_file_id(hex_digest: str, hash_algo: str) -> str:
+    """Store the digest for `hash_algo` in a way that never crosses algorithms.
+
+    The default sha256 keeps its historical bare-hex form byte-for-byte (the
+    existing cache entries must stay valid); every other algorithm is namespaced
+    with an 'algo:' prefix, which a bare hex digest can never contain, so runs
+    with different algorithms cannot serve each other's entries.
+    """
+    if hash_algo == DEFAULT_HASH_ALGO:
+        return hex_digest
+    return f"{hash_algo}:{hex_digest}"
+
+
+def resolve_cached_file_id(file_id: str, hash_algo: str) -> str | None:
+    """Return the usable digest stored for `hash_algo`, or None on namespace miss.
+
+    The unique-size sentinel is never a hit; a bare (unprefixed) id counts as a
+    hit only for the default sha256 run; a prefixed id only hits its own algo.
+    """
+    if file_id == UNIQUE_SIZE_SENTINEL:
+        return None
+    if hash_algo == DEFAULT_HASH_ALGO:
+        return None if ":" in file_id else file_id
+    prefix = f"{hash_algo}:"
+    return file_id[len(prefix):] if file_id.startswith(prefix) else None
+
+def write_cache_to_file(cache: Cache, cache_file: str) -> None:
     """Write the cache to the cache file atomically.
 
     The temporary file lives in the cache file's own directory, so the final
@@ -75,7 +128,7 @@ def write_cache_to_file(cache, cache_file):
         temp_file_path = temp_file.name
     os.replace(temp_file_path, cache_file)
 
-def load_cache(cache_file):
+def load_cache(cache_file: str) -> Cache:
     """Load the cache from the cache file."""
     if not os.path.exists(cache_file):
         return {}
@@ -86,7 +139,8 @@ def load_cache(cache_file):
         os.remove(cache_file)
         return {}
 
-def update_cache(cache, file_path, file_id, st=None):
+def update_cache(cache: Cache, file_path: str, file_id: str,
+                 st: os.stat_result | None = None) -> None:
     """Update the cache with the file information.
 
     Pass `st` (an os.stat_result already collected for this path) to reuse its
@@ -101,16 +155,17 @@ def update_cache(cache, file_path, file_id, st=None):
         'size': st.st_size
     }
 
-def get_file_id(file_path, cache, st=None):
-    """Process a single file and return its file ID.
+def get_file_id(file_path: str, cache: Cache, st: os.stat_result | None = None,
+                hash_algo: str = DEFAULT_HASH_ALGO) -> str:
+    """Process a single file and return its file ID for `hash_algo`.
 
     The cache hit check reuses the same stat snapshot (`st`) instead of extra
     getmtime/getsize calls: when cached modified_time and size match the
-    snapshot and the cached value is a real digest (not UNIQUE_SIZE_SENTINEL),
-    the cached file_id is returned as-is (no re-hash). A sentinel never counts
-    as a hit: if this file's size became shared with another file, its content
-    must actually be hashed now. Otherwise the hash is recomputed and the cache
-    entry updated from the same snapshot.
+    snapshot and the stored value is a real digest in this algorithm's
+    namespace (see resolve_cached_file_id), the cached file_id is returned
+    as-is (no re-hash). A unique-size sentinel, and any entry from a
+    different algorithm's namespace, never counts as a hit: the content is
+    hashed for real and the entry updated from the same snapshot.
     Raises OSError (incl. PermissionError) for unreadable/vanished files, which
     the caller handles per file.
     """
@@ -119,19 +174,18 @@ def get_file_id(file_path, cache, st=None):
 
     file_info = cache.get(file_path)
     if file_info:
-        cached_modified_time = file_info.get('modified_time')
-        cached_size = file_info.get('size')
         cached_file_id = file_info.get('file_id')
-
-        if cached_file_id != UNIQUE_SIZE_SENTINEL and \
-                cached_modified_time == st.st_mtime and cached_size == st.st_size:
+        if isinstance(cached_file_id, str) \
+                and file_info.get('modified_time') == st.st_mtime \
+                and file_info.get('size') == st.st_size \
+                and resolve_cached_file_id(cached_file_id, hash_algo) is not None:
             return cached_file_id
 
-    file_id = generate_file_identifier(file_path)
+    file_id = encode_cached_file_id(generate_file_identifier(file_path, hash_algo), hash_algo)
     update_cache(cache, file_path, file_id, st)
     return file_id
 
-def parse_exclude_file(exclude_file):
+def parse_exclude_file(exclude_file: str) -> list[str]:
     """Parse the exclude file and return a list of keywords."""
     try:
         with open(exclude_file, 'r') as file:
@@ -173,7 +227,10 @@ def warn_if_sync_marker(directory: str) -> None:
             directory, marker
         )
 
-def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, exclude_keywords=None, min_size=1, try_run=False, cross_dirs_only=False):
+def find_duplicates(directories: list[str], cache_file: str = 'file_cache.json',
+                    batch_size: int = DEFAULT_CACHE_BATCH, exclude_keywords: list[str] | None = None,
+                    min_size: int = DEFAULT_MIN_SIZE, try_run: bool = False,
+                    cross_dirs_only: bool = False, hash_algo: str = DEFAULT_HASH_ALGO) -> FileDict:
     """Find duplicate files in the given directories.
 
     Two-phase size prefiltering:
@@ -218,6 +275,14 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
       are entirely internal to one root are dropped after grouping (they never
       enter the result dict nor the action phase). Off by default, in which
       case this step does not run and behavior is exactly as before.
+
+    Progress reporting: both loops emit one INFO milestone per
+    `PROGRESS_INTERVAL` processed files (entries collected / files hashed,
+    with elapsed seconds); there are no per-file log records anymore.
+
+    Hash algorithm: `hash_algo` selects the digest; entries stored by another
+    algorithm never hit (see encode/resolve_cached_file_id), and the default
+    sha256 keeps the historical bare-hex cache format byte-for-byte.
     """
     lock_file = f"{cache_file}.lock"
     lock = FileLock(lock_file)
@@ -227,7 +292,7 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
     n_symlink = 0
     n_error = 0
     n_dirs_scanned = 0
-    interrupted = None
+    interrupted: CacheInterrupted | None = None
     # 信号处理器只记录信号号；异常在扫描循环的安全点抛出。
     # 不在 handler 里直接 raise：中断可能恰好落在 logging/文件写入等库函数
     # 内部，那些函数有自己的宽泛异常处理，会把外来异常吞掉，导致中断丢失。
@@ -249,8 +314,11 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
 
     with lock:
         cache = load_cache(cache_file)
-        file_dict = {}
-        cache_updates = []
+        file_dict: FileDict = {}
+        cache_updates: list[str] = []
+        t_scan_start = time.monotonic()
+        n_collected = 0
+        n_hashed = 0
 
         previous_handlers = {}
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -258,7 +326,7 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
             signal.signal(sig, _stop_on_signal)
         try:
             # ---- 阶段一：仅收集 (size, stat 快照)，不读任何文件内容 ----
-            size_groups = {}
+            size_groups: dict[int, list[tuple[str, os.stat_result]]] = {}
             directories = list(set(directories))
             for directory in directories:
                 n_dirs_scanned += 1
@@ -268,8 +336,11 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
                     for file in files:
                         # 每个文件开头检查一次待处理信号（安全点，粒度为单文件，响应为毫秒级）
                         _check_interrupt()
+                        n_collected += 1
+                        if n_collected % PROGRESS_INTERVAL == 0:
+                            logger.info("Progress: %d file entries collected (%.1fs elapsed)",
+                                        n_collected, time.monotonic() - t_scan_start)
                         file_path = os.path.join(root, file)
-                        logger.debug("Collecting file: %s", file_path)
                         # 检查文件路径是否包含排除关键字
                         if exclude_keywords and any(keyword in file_path for keyword in exclude_keywords):
                             logger.debug(f"Excluding file: {file_path}")
@@ -322,21 +393,24 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
             # ---- 阶段二：仅同 size 候选 >= 2 的文件才真正读取内容做哈希 ----
             for file_path, st in hash_queue:
                 _check_interrupt()
+                n_hashed += 1
+                if n_hashed % PROGRESS_INTERVAL == 0:
+                    logger.info("Progress: %d files hashed (%.1fs elapsed)",
+                                n_hashed, time.monotonic() - t_scan_start)
                 try:
-                    file_id = get_file_id(file_path, cache, st)
+                    file_id = get_file_id(file_path, cache, st, hash_algo)
                 except (OSError, PermissionError) as e:
                     # 不可读/中途消失的文件：一条警告后继续，缓存不写其条目
                     logger.warning(f"Error accessing file: {file_path} - {e}")
                     n_error += 1
                     continue
 
-                file_info = {
+                file_info: FileEntry = {
                     'path': file_path,
                     'size': st.st_size,
                     'type': os.path.splitext(file_path)[1],
                     'modified_time': st.st_mtime
                 }
-                logger.debug("Process File ID: %s, File Info: %s", file_id, file_info)
 
                 if file_id in file_dict:
                     file_dict[file_id].append(file_info)
@@ -391,84 +465,12 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
 
     return file_dict
 
-def split_path_components(path: str) -> list[str]:
-    """Split a path into its directory/filename components.
-
-    Both POSIX and Windows separators are normalized before splitting and
-    empty components (leading or repeated separators) are dropped, so
-    '/a/b', 'a/b' and 'a\\\\b' all yield the same component sequence.
-    """
-    return [component for component in path.replace("\\", "/").split("/") if component]
-
-
-def path_matches_keyword(path: str, keyword: str) -> bool:
-    """Component-aware keyword matching (replaces the old bare-substring rule).
-
-    The keyword's component sequence matches when it occurs as a contiguous
-    run of the path's components: a single-component keyword must equal one
-    whole component; a multi-component keyword must align with consecutive
-    components. Trailing separators on the keyword are ignored, so 'dirA' and
-    'dirA/' behave identically. Because whole components are compared, 'dirA'
-    matches files under the directory component 'dirA' but never a sibling
-    named 'dirA-nm' — the bare substring rule matched both, which is how
-    adjacent directories with a shared name prefix used to be caught in the
-    same net. An empty keyword matches nothing.
-    """
-    keyword_components = split_path_components(keyword)
-    if not keyword_components:
-        return False
-    path_components = split_path_components(path)
-    width = len(keyword_components)
-    return any(
-        path_components[start:start + width] == keyword_components
-        for start in range(len(path_components) - width + 1)
-    )
-
-
 def scan_root_components(directories: list[str]) -> list[list[str]]:
     """Normalized absolute component sequence for each scan root given by -d."""
     return [split_path_components(os.path.abspath(directory)) for directory in directories]
 
 
-# 结果文件结构校验：消费（cross-dirs 裁剪 / 优先级选择 / 动作执行）之前的前置守卫。
-# 选择"报错退出"而非"自动补排"：载入的语义是尊重文件里既有的优先级决定，
-# 静默重排会改变使用者的意图；结构不合法时必须零动作把问题逐条讲清楚。
-RESULT_SCHEMA_PROBLEM_LIMIT = 20
-
-
-def validate_result_schema(data) -> list:
-    """Return human-readable problems found in a loaded duplicates-result structure.
-
-    Requirements: top level is a dict of group-key -> list of entry dicts; every
-    entry carries a str 'path' and an int 'priority' (bool is rejected although
-    it is an int subclass). An empty list means the structure is consumable.
-    """
-    if not isinstance(data, dict):
-        return [f"top level must be an object mapping group keys to entry lists, "
-                f"got {type(data).__name__}"]
-    problems = []
-    for group_key, entries in data.items():
-        if not isinstance(entries, list):
-            problems.append(f"group {group_key!r}: value must be a list of entries, "
-                            f"got {type(entries).__name__}")
-            continue
-        for index, entry in enumerate(entries):
-            location = f"group {group_key!r} entry #{index}"
-            if not isinstance(entry, dict):
-                problems.append(f"{location}: entry must be an object, "
-                                f"got {type(entry).__name__}")
-                continue
-            path = entry.get("path")
-            if not isinstance(path, str):
-                problems.append(f"{location}: field 'path' missing or not a string")
-            priority = entry.get("priority")
-            if isinstance(priority, bool) or not isinstance(priority, int):
-                problems.append(f"{location} (path={path!r}): "
-                                f"field 'priority' missing or not an integer")
-    return problems
-
-
-def report_result_schema_problems(problems, source) -> None:
+def report_result_schema_problems(problems: list[str], source: str) -> None:
     """Log schema problems one per line, capped at RESULT_SCHEMA_PROBLEM_LIMIT,
     with the full total always stated."""
     logger.error("Invalid duplicates result file %s: %d problem(s) found",
@@ -536,7 +538,8 @@ def apply_cross_dirs_scope(file_dict: dict[str, list[dict]], directories: list[s
     return kept
 
 
-def assign_priorities(file_dict, retain_keywords, priority_order=None):
+def assign_priorities(file_dict: FileDict, retain_keywords: list[str] | None,
+                      priority_order: list[str] | None = None) -> None:
     """Assign priorities to files based on the given criteria.
 
     Retain keywords and the 'path' priority field share the same component
@@ -547,6 +550,19 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
     if priority_order is None:
         # Default priority order
         priority_order = ['modified_time', 'path']
+    order = priority_order
+
+    def _order_key(x: FileEntry) -> tuple:
+        keys: list[float] = []
+        for field in order:
+            value = x[field]
+            if field == 'modified_time':      # 修改时间字段升序排列
+                keys.append(value)
+            elif field == 'path':             # 路径字段按分量深度降序（与关键字匹配共用分量切分）
+                keys.append(-len(split_path_components(value)))
+            else:                             # 其他数值字段降序排列
+                keys.append(-value)
+        return tuple(keys)
 
     for file_id, files in file_dict.items():
         # 检查同一 file_id 下的文件大小是否一致
@@ -565,15 +581,7 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
             continue
 
         priority_counter = 1  # Start from 1 for non-retained files
-        files.sort(
-            key=lambda x: tuple(
-                x[order] if order == 'modified_time'  # 修改时间字段升序排列
-                else (-len(split_path_components(x[order]))  # 路径字段按分量深度降序
-                      if order == 'path'               # （斜杠风格归一，与关键字匹配共用分量切分）
-                      else -x[order])                  # 其他数值字段降序排列
-                for order in priority_order
-            )
-        )
+        files.sort(key=_order_key)
         # Assign priorities to all files
         for file_info in files:
             # 保留关键字按路径分量匹配（连续整分量序列；见 path_matches_keyword）
@@ -586,7 +594,7 @@ def assign_priorities(file_dict, retain_keywords, priority_order=None):
                 priority_counter += 1
 
 
-def select_files_for_processing(file_dict) -> list:
+def select_files_for_processing(file_dict: FileDict) -> list[tuple[str, FileEntry]]:
     """Return [(file_id, file_info), ...] in the exact order and set retain_files acts on.
 
     Selection rule (unchanged from the action phase itself): within each
@@ -596,7 +604,7 @@ def select_files_for_processing(file_dict) -> list:
     retain_files and the candidate-list export so the exported list cannot
     drift from what actually gets processed.
     """
-    queue = []
+    queue: list[tuple[str, FileEntry]] = []
     for file_id, files in file_dict.items():
         files.sort(key=lambda x: x['priority'])
         highest_priority = files[0]['priority']
@@ -606,7 +614,7 @@ def select_files_for_processing(file_dict) -> list:
     return queue
 
 
-def export_candidates(paths, out_path: str) -> bool:
+def export_candidates(paths: Iterable[str], out_path: str) -> bool:
     """Write the pending-processing list, one absolute source path per line.
 
     Pure output of the already-decided processing queue (cross-root filtering,
@@ -617,22 +625,25 @@ def export_candidates(paths, out_path: str) -> bool:
     silently missing.
     """
     absolute_out = os.path.abspath(out_path)
+    path_list = list(paths)
     try:
         os.makedirs(os.path.dirname(absolute_out), exist_ok=True)
         with open(absolute_out, "w") as out_file:
-            for path in paths:
+            for path in path_list:
                 out_file.write(os.path.abspath(path) + "\n")
     except OSError as e:
         logger.error("Cannot write candidate list to %s: %s", out_path, e)
         return False
-    logger.info("Candidate list exported: %s (%d file(s))", out_path, len(paths))
+    logger.info("Candidate list exported: %s (%d file(s))", out_path, len(path_list))
     return True
 
 
-def retain_files(file_dict, action, move_to_dir=None, try_run=False, manifest=None):
+def retain_files(file_dict: FileDict, action: str, move_to_dir: str | None = None,
+                 try_run: bool = False, manifest: "MoveManifest | None" = None,
+                 min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
     """Retain files based on the priority and process the rest."""
     for file_id, file in select_files_for_processing(file_dict):
-        process_file(file, action, move_to_dir, try_run, file_id, manifest)
+        process_file(file, action, move_to_dir, try_run, file_id, manifest, min_free_percent)
 
 
 # def check_filename_length(filename):
@@ -641,7 +652,10 @@ def retain_files(file_dict, action, move_to_dir=None, try_run=False, manifest=No
 #     return byte_length <= 255
 
 
-def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, manifest=None):
+def process_file(file: FileEntry, action: str, move_to_dir: str | None = None,
+                 try_run: bool = False, file_id: str | None = None,
+                 manifest: "MoveManifest | None" = None,
+                 min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
     # 操作类型校验
     if action not in ['delete', 'move']:
         logger.warning(f"Unsupported action: {action}. Skipping file: {file['path']}")
@@ -658,6 +672,11 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, ma
                 logger.error(f"Error deleting {file['path']}: {e}")
     elif action == 'move':
         if move_to_dir:
+            # 目标路径按 file_id 建子目录；缺失 id 属于内部异常调用，拒绝执行而非拼出错误路径
+            if file_id is None:
+                logger.error("Internal error: move with --move-to-dir requires a file id for %s",
+                             file['path'])
+                return
             # 创建file_id目录
             target_dir = os.path.join(move_to_dir, file_id)
             # 获取源文件的相对路径（基于系统根目录）
@@ -683,10 +702,10 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, ma
                 logger.debug(f"移动文件需要空间：{file_size} 字节，剩余空间: {free} 字节 ({free_percent:.1f}%)")
 
                 # 空间不足判断
-                if free < file_size or free_percent < 5:
+                if free < file_size or free_percent < min_free_percent:
                     logger.error(f"空间不足阻止移动：{file['path']} -> {new_path}")
                     logger.error(f"需要空间: {file_size} 字节 | 剩余空间: {free} 字节 ({free_percent:.1f}%)")
-                    return None
+                    return
                 # 新增空间检查逻辑（结束）
                 try:
                     shutil.move(file['path'], new_path)
@@ -706,7 +725,16 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None, ma
                     logger.info(f"Renamed: {file['path']} to {new_path}")
                 except Exception as e:
                     logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
-def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False, undo=None, export_candidates_path=None):
+
+
+def main(directories: list[str], action: str, priority_order: list[str] | None = None,
+         move_to_dir: str | None = None, try_run: bool = False,
+         exclude_keywords: list[str] | None = None, retain_keywords: list[str] | None = None,
+         file_dict_path: str | None = None, min_size: int = DEFAULT_MIN_SIZE,
+         cache_batch: int = DEFAULT_CACHE_BATCH, cross_dirs_only: bool = False,
+         undo: str | None = None, export_candidates_path: str | None = None,
+         hash_algo: str = DEFAULT_HASH_ALGO,
+         min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
     if undo is not None:
         # --undo 与扫描互斥：只按清单反向恢复，不扫描、不读缓存、不产结果文件
         manifests = collect_move_manifests(undo)
@@ -746,7 +774,8 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
         file_dict = find_duplicates(directories, exclude_keywords=exclude_keywords,
                                     min_size=min_size, try_run=try_run,
                                     batch_size=cache_batch,
-                                    cross_dirs_only=cross_dirs_only)
+                                    cross_dirs_only=cross_dirs_only,
+                                    hash_algo=hash_algo)
         assign_priorities(file_dict, retain_keywords, priority_order=priority_order)
         if try_run:
             # 演练模式不写重复结果文件，正式状态零污染
@@ -767,7 +796,7 @@ def main(directories, action, priority_order=None, move_to_dir=None, try_run=Fal
         if not export_candidates(pending_paths, export_candidates_path):
             sys.exit(1)
 
-    retain_files(file_dict, action, move_to_dir, try_run, manifest)
+    retain_files(file_dict, action, move_to_dir, try_run, manifest, min_free_percent)
     if manifest is not None:
         manifest.log_summary()
 
@@ -818,7 +847,7 @@ def collect_move_manifests(target: str) -> list[str]:
     return []
 
 
-def prune_empty_dirs_under(boundary: str, start_paths) -> None:
+def prune_empty_dirs_under(boundary: str, start_paths: Iterable[str]) -> None:
     """Delete directories that became empty inside the recycle dir, bottom-up.
 
     Walks from each start directory upward but stops at the boundary (the
@@ -836,7 +865,7 @@ def prune_empty_dirs_under(boundary: str, start_paths) -> None:
             current = os.path.dirname(current)
 
 
-def undo_moves(manifest_paths: list[str]) -> dict:
+def undo_moves(manifest_paths: list[str]) -> dict[str, int]:
     """Restore recorded moves by replaying every {src, dst} entry in reverse.
 
     Rules (mirroring the battle-tested manual recovery procedure): an existing
@@ -911,14 +940,29 @@ if __name__ == "__main__":
     parser.add_argument("--priority-order", "-p", nargs='+', required=False, help="Custom priority order: default is modified_time, path")
     parser.add_argument("--move-to-dir", "-m", required=False, help="Directory to move files to (if not specified, rename files with .dup_finder suffix)")
     parser.add_argument("--try-run", "-n", action='store_true', required=False, help="Try run mode: only print actions without executing them")
-    parser.add_argument("--min-size", type=int, default=1, required=False,
+    parser.add_argument("--min-size", type=int, default=DEFAULT_MIN_SIZE, required=False,
                         help="Minimum file size in bytes to participate in duplicate detection; "
                              "files smaller than this (including 0-byte files, by default) are "
                              "skipped during scanning and counted in the scan summary (default: 1)")
-    parser.add_argument("--cache-batch", type=int, default=2000, required=False,
+    parser.add_argument("--cache-batch", type=int, default=DEFAULT_CACHE_BATCH, required=False,
                         help="Number of newly hashed files to accumulate in memory before the hash "
-                             "cache file is rewritten in one batch; the cache is also flushed once "
-                             "when the scan ends and once more if the scan is interrupted (default: 2000)")
+                             f"cache file is rewritten in one batch; the cache is also flushed once "
+                             f"when the scan ends and once more if the scan is interrupted "
+                             f"(default: {DEFAULT_CACHE_BATCH})")
+    parser.add_argument("--hash-algo", choices=HASH_ALGO_CHOICES, default=DEFAULT_HASH_ALGO,
+                        required=False,
+                        help="Hash algorithm used to identify duplicate content (default: "
+                             f"{DEFAULT_HASH_ALGO}). Cache entries are namespaced per algorithm: "
+                             "ids stored by a non-default algorithm are prefixed 'algo:' and are "
+                             "never exchanged with other algorithms' runs, while the default "
+                             "sha256 keeps the historical bare-hex cache format fully reusable "
+                             "byte-for-byte")
+    parser.add_argument("--min-free-percent", type=float, default=DEFAULT_MIN_FREE_PERCENT,
+                        required=False, metavar="PERCENT",
+                        help="Refuse a move when the destination volume's free space drops below "
+                             f"this percentage of its total capacity (default: "
+                             f"{DEFAULT_MIN_FREE_PERCENT:g}); a move is also refused when the free "
+                             "bytes cannot hold the single file")
     parser.add_argument("--cross-dirs-only", action='store_true', required=False,
                         help="Only act on duplicate groups whose files span two or more of the "
                              "scan roots given by -d; groups lying entirely inside one root are "
@@ -980,7 +1024,8 @@ if __name__ == "__main__":
              exclude_keywords=exclude_keywords, retain_keywords=retain_keywords,
              file_dict_path=args.duplicates_result_file, min_size=args.min_size,
              cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only,
-             undo=args.undo, export_candidates_path=args.export_candidates)
+             undo=args.undo, export_candidates_path=args.export_candidates,
+             hash_algo=args.hash_algo, min_free_percent=args.min_free_percent)
     except CacheInterrupted:
         # 扫描循环已在锁内完成一次受控落盘；此处只做非零码干净退出，不打印 traceback
         sys.exit(1)

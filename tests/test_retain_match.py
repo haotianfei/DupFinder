@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from conftest import console_output, moved_payload_files
+from conftest import console_lines_with, console_output, moved_payload_files
 
 TRAP_CONTENT = b"trap-content" * 100  # 1200B：三成员同内容同 size，落入同一重复组
 
@@ -37,7 +37,7 @@ def _shape(t):
 
 
 def _deleted_paths(console_text):
-    return [ln for ln in console_text.splitlines() if "Deleted:" in ln]
+    return console_lines_with(console_text, "Deleted:")
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ def test_retain_dir_component_move_takes_only_sibling_decoy(dup_tree):
     out = console_output(proc)
     assert proc.returncode == 0, out
 
-    moved_lines = [ln for ln in out.splitlines() if "Moved:" in ln]
+    moved_lines = console_lines_with(out, "Moved:")
     assert len(moved_lines) == 1 and "A/dirA-nm/decoy.txt" in moved_lines[0]
     t.assert_file_unchanged("A/dirA/keep.txt", before)
     t.assert_file_unchanged("A/dirA/nested/inner.txt", before)

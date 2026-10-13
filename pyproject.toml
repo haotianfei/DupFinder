@@ -20,7 +20,12 @@ dev = [
 # 仓库保持平铺脚本结构（不重构为包），显式声明顶层模块，
 # 保证 `pip install -e .[dev]` 可用且不触发 setuptools 自动发现的歧义。
 [tool.setuptools]
-py-modules = ["dup_finder", "logger", "change_priority"]
+py-modules = ["dup_finder", "logger", "change_priority", "pathlogic"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# 最简静态检查配置：目标是核心脚本无类型错误，不启用 strict 类教条选项
+[tool.mypy]
+files = ["dup_finder.py", "logger.py", "change_priority.py", "pathlogic.py"]
+ignore_missing_imports = true

@@ -7,37 +7,27 @@
 import hashlib
 import json
 import os
-import re
 import stat
 
 import pytest
-from conftest import console_output, moved_payload_files
+from conftest import console_lines_with, console_output, moved_payload_files, scan_summary
 
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-SUMMARY_RE = re.compile(
-    r"Scan summary: skipped small/empty=(\d+) \(empty=(\d+)\), symlinks=(\d+), errors=(\d+)"
-)
-
-
-def _summary(text):
-    m = SUMMARY_RE.search(text)
-    assert m, f"未找到扫描汇总行: {text!r}"
-    return tuple(int(g) for g in m.groups())  # (small/empty, empty, symlinks, errors)
-
-
 _ACTION_MARKERS = ("Would delete", "Would move", "Would rename", "Deleted:", "Moved:", "Renamed:")
 
 
 def _assert_never_in_action_lines(text, *substrings):
-    """任何一条处理动作日志（演练或实删/实移）都不得提及这些路径特征。"""
+    """任何一条处理动作日志（演练或实删/实移）都不得提及这些路径特征。
+    动作标记互斥、单行只会含其一，故按 OR 语义取动作行。"""
     for line in text.splitlines():
-        if any(marker in line for marker in _ACTION_MARKERS):
-            for s in substrings:
-                assert s not in line, f"处理动作波及被排除文件 {s!r}: {line}"
+        if not any(marker in line for marker in _ACTION_MARKERS):
+            continue
+        for s in substrings:
+            assert s not in line, f"处理动作波及被排除文件 {s!r}: {line}"
 
 
 def _assert_protected_untouched(t, before):
@@ -106,7 +96,7 @@ def test_empty_and_symlink_untouched_under_try_run(full_tree):
     console = console_output(proc)
 
     assert proc.returncode == 0, console
-    assert _summary(console) == (2, 2, 1, 1)
+    assert scan_summary(console) == (2, 2, 1, 1)
     _assert_protected_untouched(t, before)
     t.assert_no_file_changed(before)  # 演练模式下整棵树都不应变化
     _assert_never_in_action_lines(console, "empty.bin", "sym_link.txt", "secret.bin")
@@ -132,7 +122,7 @@ def test_empty_and_symlink_untouched_under_delete(full_tree):
     console = console_output(proc)
 
     assert proc.returncode == 0, console
-    assert _summary(console) == (2, 2, 1, 1)
+    assert scan_summary(console) == (2, 2, 1, 1)
     _assert_protected_untouched(t, before)
     _assert_never_in_action_lines(console, "empty.bin", "sym_link.txt", "secret.bin")
 
@@ -157,7 +147,7 @@ def test_empty_and_symlink_untouched_under_move(full_tree):
     console = console_output(proc)
 
     assert proc.returncode == 0, console
-    assert _summary(console) == (2, 2, 1, 1)
+    assert scan_summary(console) == (2, 2, 1, 1)
     _assert_protected_untouched(t, before)
     _assert_never_in_action_lines(console, "empty.bin", "sym_link.txt", "secret.bin")
 
@@ -182,7 +172,7 @@ def test_min_size_excludes_small_duplicates_entirely(dup_tree_factory):
     content = _add_small_pair(t1)
     proc = _real_run(t1)
     assert proc.returncode == 0, console_output(proc)
-    assert _summary(console_output(proc)) == (0, 0, 0, 0)
+    assert scan_summary(console_output(proc)) == (0, 0, 0, 0)
     data, _ = t1.load_result_json()
     assert set(data) == {_sha(content)}
     assert {e["path"] for e in data[_sha(content)]} == {"A/small1.bin", "B/small2.bin"}
@@ -191,7 +181,7 @@ def test_min_size_excludes_small_duplicates_entirely(dup_tree_factory):
     _add_small_pair(t2)
     proc = _real_run(t2, "--min-size", "50")
     assert proc.returncode == 0, console_output(proc)
-    assert _summary(console_output(proc)) == (2, 0, 0, 0)
+    assert scan_summary(console_output(proc)) == (2, 0, 0, 0)
     data, _ = t2.load_result_json()
     assert data == {}
 
@@ -229,7 +219,7 @@ def test_unreadable_file_warns_once_and_scan_completes(full_tree):
     warn_lines = [ln for ln in console.splitlines() if "A/secret.bin" in ln]
     assert len(warn_lines) == 1, f"不可读文件应只产生一条控制台记录，实际 {len(warn_lines)} 条: {warn_lines}"
     assert "WARNING" in warn_lines[0]
-    assert _summary(console) == (2, 2, 1, 1)
+    assert scan_summary(console) == (2, 2, 1, 1)
 
     # 其余文件处理完整：两对真实重复都被完整识别
     data, _ = t.load_result_json()

@@ -220,7 +220,8 @@ def test_behavior_without_export_flag_is_unchanged(dup_tree):
     assert "Candidate list exported" not in out
 
     top = {p.name for p in t.workdir.iterdir()}
-    fixed = {"A", "B", "trash", "dup_finder.py", "logger.py", "__pycache__", "logs",
+    fixed = {"A", "B", "trash", "dup_finder.py", "logger.py", "pathlogic.py",
+           "__pycache__", "logs",
              "file_cache.json", "file_cache.json.lock"}
     assert top >= fixed, fixed - top
     extras = top - fixed

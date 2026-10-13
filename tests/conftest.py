@@ -30,6 +30,7 @@ mtime_ns/size 快照比对（它们都在 .gitignore 里，git status 不可见�
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,24 @@ def console_output(proc):
     不绑定具体流归属（后续若日志收紧改流也不受影响）。各测试文件共用此函数。
     """
     return (proc.stdout or "") + (proc.stderr or "")
+
+
+def console_lines_with(text, *markers):
+    """返回控制台文本中同时含有全部 marker 的日志行（保持原行序）。"""
+    return [line for line in text.splitlines() if all(marker in line for marker in markers)]
+
+
+# 扫描汇总行（"Scan summary: skipped ..."）与各中断/撤销计数行的共享解析器
+SCAN_SUMMARY_RE = re.compile(
+    r"Scan summary: skipped small/empty=(\d+) \(empty=(\d+)\), symlinks=(\d+), errors=(\d+)"
+)
+
+
+def scan_summary(text):
+    """解析 Scan summary 行为 (small/empty, empty, symlinks, errors) 整数元组。"""
+    match = SCAN_SUMMARY_RE.search(text)
+    assert match, f"未找到扫描汇总行:\n{text!r}"
+    return tuple(int(group) for group in match.groups())
 
 
 MANIFEST_PREFIX = "moves_"
@@ -402,12 +421,15 @@ class DupTree:
 # fixtures
 # --------------------------------------------------------------------------
 
+RUNTIME_MODULES = ("dup_finder.py", "logger.py", "pathlogic.py")
+
+
 def _make_workdir(base):
-    """复制顶层脚本到独立目录并建好 A/ B/ 扫描根——一切产物都只会落在这里。"""
+    """复制顶层运行时代码到独立目录并建好 A/ B/ 扫描根——一切产物都只会落在这里。"""
     base = Path(base)
     base.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(REPO_ROOT / "dup_finder.py"), str(base / "dup_finder.py"))
-    shutil.copy2(str(REPO_ROOT / "logger.py"), str(base / "logger.py"))
+    for module in RUNTIME_MODULES:
+        shutil.copy2(str(REPO_ROOT / module), str(base / module))
     (base / "A").mkdir(exist_ok=True)
     (base / "B").mkdir(exist_ok=True)
     return DupTree(base)

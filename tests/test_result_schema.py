@@ -14,7 +14,7 @@ validate_result_schema 守卫——顶层 dict[str, list]、条目 dict 且含 s
 import hashlib
 import json
 
-from conftest import console_output
+from conftest import console_lines_with, console_output
 
 FAKE_ID_1 = "a" * 64          # 64 位小写 hex：形状等同真实 sha256，仅用于缓存播种
 FAKE_ID_2 = "b" * 64
@@ -41,7 +41,8 @@ def _make_cross_pair(t, content, a_rel="A/p.txt", b_rel="B/p-copy.txt"):
 
 
 def _error_lines(out):
-    return [ln for ln in out.splitlines() if "ERROR" in ln]
+    # 只认格式化器中独立成段的级别字段，避免与正文里出现的大写单词误撞
+    return console_lines_with(out, " - ERROR - ")
 
 
 # ---------------------------------------------------------------------------

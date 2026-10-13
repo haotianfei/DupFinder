@@ -11,28 +11,17 @@
 
 import hashlib
 import json
-import re
 import stat as stat_mod
 
 import pytest
 
-from conftest import console_output
+from conftest import console_output, scan_summary
 
 UNIQUE_SIZE_SENTINEL = "Z:unique-size"  # CLI 行为契约字符串：含非 hex 字符，任何摘要都不等于它
-
-SUMMARY_RE = re.compile(
-    r"Scan summary: skipped small/empty=(\d+) \(empty=(\d+)\), symlinks=(\d+), errors=(\d+)"
-)
 
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
-
-
-def _summary(text):
-    m = SUMMARY_RE.search(text)
-    assert m, f"未找到扫描汇总行:\n{text!r}"
-    return tuple(int(g) for g in m.groups())  # (small/empty, empty, symlinks, errors)
 
 
 def _make_pair(t, rel_a, rel_b, content):
@@ -132,7 +121,7 @@ def test_unique_size_file_never_reads_content(dup_tree):
     assert proc1.returncode == 0, out1
     # 行为侧证：不可读的 size 唯一文件没有产生任何读取尝试（错误/警告为零）
     assert "Error accessing" not in out1, out1
-    assert _summary(out1)[3] == 0, f"errors 计数应为 0:\n{out1}"
+    assert scan_summary(out1)[3] == 0, f"errors 计数应为 0:\n{out1}"
 
     cache = json.loads(t.cache_path().read_text())
     assert cache["A/guard.bin"]["file_id"] == UNIQUE_SIZE_SENTINEL
@@ -151,7 +140,7 @@ def test_unique_size_file_never_reads_content(dup_tree):
     out2 = console_output(proc2)
     assert proc2.returncode == 0, out2
     assert "Error accessing" not in out2, out2
-    assert _summary(out2)[3] == 0
+    assert scan_summary(out2)[3] == 0
     cache2 = json.loads(t.cache_path().read_text())
     assert cache2["A/guard.bin"]["file_id"] == UNIQUE_SIZE_SENTINEL
     files = sorted(t.workdir.glob("duplicates_*.json"))

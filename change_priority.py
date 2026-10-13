@@ -2,7 +2,7 @@ import json
 import argparse
 import sys
 
-from dup_finder import (
+from pathlogic import (
     RESULT_SCHEMA_PROBLEM_LIMIT,
     path_matches_keyword,
     validate_result_schema,

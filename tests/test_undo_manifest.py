@@ -333,7 +333,7 @@ def test_undo_target_without_manifest_exits_nonzero(dup_tree):
     t.mkdir("empty_dir")
     tree_before = t.snapshot()
     # 数据目录与清单产物才是关注对象；__pycache__/logs 与脚本副本属基础设施
-    expected_names = {"A", "B", "empty_dir", "dup_finder.py", "logger.py",
+    expected_names = {"A", "B", "empty_dir", "dup_finder.py", "logger.py", "pathlogic.py",
                       "__pycache__", "logs"}
 
     proc = t.run("--undo", "empty_dir")
