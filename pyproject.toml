@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dup-finder"
+version = "0.1.0"
+description = "按文件大小与哈希查找/处理重复文件的命令行工具（dup_finder.py）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "filelock==3.12.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+# 仓库保持平铺脚本结构（不重构为包），显式声明顶层模块，
+# 保证 `pip install -e .[dev]` 可用且不触发 setuptools 自动发现的歧义。
+[tool.setuptools]
+py-modules = ["dup_finder", "logger", "change_priority"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
