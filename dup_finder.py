@@ -139,7 +139,7 @@ def parse_exclude_file(exclude_file):
         logger.error(f"Error reading exclude file {exclude_file}: {e}")
         return []
 
-def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, exclude_keywords=None, min_size=1, try_run=False):
+def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, exclude_keywords=None, min_size=1, try_run=False, cross_dirs_only=False):
     """Find duplicate files in the given directories.
 
     Two-phase size prefiltering:
@@ -177,6 +177,13 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
     Files skipped before any bookkeeping (symlinks, below min-size, errored)
     get no cache entries, so the existing cache file format and all reusable
     sha256 entries stay untouched.
+
+    Cross-directory scope:
+    - with `cross_dirs_only` enabled, a duplicate group only survives when its
+      members are spread across 2 or more of the `-d` scan roots; groups that
+      are entirely internal to one root are dropped after grouping (they never
+      enter the result dict nor the action phase). Off by default, in which
+      case this step does not run and behavior is exactly as before.
     """
     lock_file = f"{cache_file}.lock"
     lock = FileLock(lock_file)
@@ -344,6 +351,9 @@ def find_duplicates(directories, cache_file='file_cache.json', batch_size=2000, 
         n_small, n_empty, n_symlink, n_error
     )
 
+    if cross_dirs_only:
+        file_dict = apply_cross_dirs_scope(file_dict, directories)
+
     return file_dict
 
 def split_path_components(path: str) -> list[str]:
@@ -378,6 +388,67 @@ def path_matches_keyword(path: str, keyword: str) -> bool:
         path_components[start:start + width] == keyword_components
         for start in range(len(path_components) - width + 1)
     )
+
+
+def scan_root_components(directories: list[str]) -> list[list[str]]:
+    """Normalized absolute component sequence for each scan root given by -d."""
+    return [split_path_components(os.path.abspath(directory)) for directory in directories]
+
+
+def attribute_path_to_root(file_path: str, roots: list[list[str]]) -> int | None:
+    """Index of the scan root that owns `file_path`, or None if under no root.
+
+    Attribution is a component-boundary prefix match on absolute paths, and the
+    most exact (longest) matching root wins so a nested root resolves to the
+    inner one. Because whole components are compared, a root 'A' never claims a
+    file that actually lives under a sibling root 'A-nm' — the same protection
+    path_matches_keyword gives against prefix-shared siblings.
+    """
+    components = split_path_components(os.path.abspath(file_path))
+    best_index: int | None = None
+    best_len = -1
+    for index, root in enumerate(roots):
+        width = len(root)
+        if width > best_len and components[:width] == root:
+            best_index = index
+            best_len = width
+    return best_index
+
+
+def filter_cross_root_groups(
+    file_dict: dict[str, list[dict]], directories: list[str]
+) -> tuple[dict[str, list[dict]], int]:
+    """Keep only duplicate groups whose members span 2 or more scan roots.
+
+    A group where every file belongs to the same scan root (a directory's own
+    internal duplicates) is dropped as a whole and never reaches the result file
+    or the action phase. Returns the kept groups and the number of same-root
+    groups that were skipped.
+    """
+    roots = scan_root_components(directories)
+    kept: dict[str, list[dict]] = {}
+    n_same_root_skipped = 0
+    for file_id, files in file_dict.items():
+        owners = {attribute_path_to_root(file_info['path'], roots) for file_info in files}
+        if len(owners) >= 2:
+            kept[file_id] = files
+        else:
+            n_same_root_skipped += 1
+    return kept, n_same_root_skipped
+
+
+def apply_cross_dirs_scope(file_dict: dict[str, list[dict]], directories: list[str]) -> dict[str, list[dict]]:
+    """Apply the cross-dirs-only scope to an assembled result: keep only groups
+    spanning 2 or more scan roots, and report a one-line summary only when at
+    least one same-root group was actually dropped (log stays clean otherwise).
+    """
+    kept, n_same_root_skipped = filter_cross_root_groups(file_dict, directories)
+    if n_same_root_skipped:
+        logger.info(
+            "Cross-dirs-only: skipped %d same-root duplicate group(s)",
+            n_same_root_skipped
+        )
+    return kept
 
 
 def assign_priorities(file_dict, retain_keywords, priority_order=None):
@@ -509,17 +580,21 @@ def process_file(file, action, move_to_dir=None, try_run=False, file_id=None):
                     logger.info(f"Renamed: {file['path']} to {new_path}")
                 except Exception as e:
                     logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
-def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000):
+def main(directories, action, priority_order=None, move_to_dir=None, try_run=False, exclude_keywords=None, retain_keywords=None, file_dict_path=None, min_size=1, cache_batch=2000, cross_dirs_only=False):
     if file_dict_path:
         # 从指定文件中加载 file_dict
         with open(file_dict_path, 'r') as f:
             file_dict = json.load(f)
         logger.info(f"Loaded file_dict from {file_dict_path}")
+        if cross_dirs_only:
+            # 载入的历史结果同样按本次传入的扫描根做跨目录专属裁剪
+            file_dict = apply_cross_dirs_scope(file_dict, directories)
     else:
         # 找到重复文件（try-run 时扫描全程不写正式缓存）
         file_dict = find_duplicates(directories, exclude_keywords=exclude_keywords,
                                     min_size=min_size, try_run=try_run,
-                                    batch_size=cache_batch)
+                                    batch_size=cache_batch,
+                                    cross_dirs_only=cross_dirs_only)
         assign_priorities(file_dict, retain_keywords, priority_order=priority_order)
         if try_run:
             # 演练模式不写重复结果文件，正式状态零污染
@@ -550,6 +625,13 @@ if __name__ == "__main__":
                         help="Number of newly hashed files to accumulate in memory before the hash "
                              "cache file is rewritten in one batch; the cache is also flushed once "
                              "when the scan ends and once more if the scan is interrupted (default: 2000)")
+    parser.add_argument("--cross-dirs-only", action='store_true', required=False,
+                        help="Only act on duplicate groups whose files span two or more of the "
+                             "scan roots given by -d; groups lying entirely inside one root are "
+                             "skipped as a whole. Example: dup_finder.py -d A B --cross-dirs-only "
+                             "--action move -m trash moves B's files that also exist in A while "
+                             "leaving A itself, and B's own internal duplicates, untouched. "
+                             "(default: off)")
     # 添加 exclude 和 exclude-file 参数
     parser.add_argument("--exclude", nargs='+', required=False, help="Exclude files use keywords, ")
     parser.add_argument("--exclude-file", required=False, help="File containing exclude keywords, one per line")
@@ -577,7 +659,7 @@ if __name__ == "__main__":
         main(args.directories, args.action, args.priority_order, args.move_to_dir, args.try_run,
              exclude_keywords=exclude_keywords, retain_keywords=retain_keywords,
              file_dict_path=args.duplicates_result_file, min_size=args.min_size,
-             cache_batch=args.cache_batch)
+             cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only)
     except CacheInterrupted:
         # 扫描循环已在锁内完成一次受控落盘；此处只做非零码干净退出，不打印 traceback
         sys.exit(1)

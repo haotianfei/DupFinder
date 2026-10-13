@@ -308,7 +308,8 @@ class DupTree:
         paths = []
         for base in under:
             root = self.workdir / base
-            if not root.exists():
+            if not root.is_dir():
+                # 允许快照范围包含本用例尚未创建的目录（如兄弟根场景），静默跳过
                 continue
             for p in sorted(root.rglob("*")):
                 if p.is_symlink() or p.is_file():
