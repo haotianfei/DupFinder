@@ -8,6 +8,10 @@
 分量匹配语义。
 
 全部经 CLI 进程边界断言外部行为（退出码、动作日志、文件系统终态、结果 JSON）。
+
+本套件依赖"异名重复被处理"（keep/inner/decoy、photo.dat/photo-copy.dat 等 basename
+互异），故逐条显式传 --no-gate-renamed 保持原断言语义（gate 本体行为由
+tests/test_renamed_gate.py 覆盖）。
 """
 
 import os
@@ -51,7 +55,7 @@ def test_retain_dir_component_delete_processes_only_sibling_decoy(dup_tree):
     _build_sibling_trap(t)
     before = t.snapshot()
 
-    proc = t.run("-d", "A", "--action", "delete", "--retain", "dirA")
+    proc = t.run("-d", "A", "--action", "delete", "--retain", "dirA", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -81,7 +85,8 @@ def test_retain_dir_component_move_takes_only_sibling_decoy(dup_tree):
     _build_sibling_trap(t)
     before = t.snapshot()
 
-    proc = t.run("-d", "A", "--action", "move", "-m", "trash", "--retain", "dirA")
+    proc = t.run("-d", "A", "--action", "move", "-m", "trash", "--retain", "dirA",
+                 "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -105,7 +110,7 @@ def test_retain_with_and_without_trailing_slash_behave_identically(dup_tree_fact
     for name, keyword in (("plain", "dirA"), ("slash", "dirA/")):
         t = dup_tree_factory(name)
         _build_sibling_trap(t)
-        proc = t.run("-d", "A", "--action", "delete", "--retain", keyword)
+        proc = t.run("-d", "A", "--action", "delete", "--retain", keyword, "--no-gate-renamed")
         out = console_output(proc)
         assert proc.returncode == 0, out
         deleted = _deleted_paths(out)
@@ -125,7 +130,7 @@ def test_retain_multi_component_keyword_matches_contiguous_run(dup_tree, keyword
     _build_sibling_trap(t)
     before = t.snapshot()
 
-    proc = t.run("-d", "A", "--action", "delete", "--retain", keyword)
+    proc = t.run("-d", "A", "--action", "delete", "--retain", keyword, "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -167,7 +172,7 @@ def test_retain_important_directory_component_readme_style(dup_tree):
     t.add_file("A/important/photo.dat", content)
     t.add_file("A/misc/photo-copy.dat", content)
 
-    proc = t.run("-d", "A", "--action", "delete", "--retain", "important")
+    proc = t.run("-d", "A", "--action", "delete", "--retain", "important", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -187,7 +192,7 @@ def test_retain_fragment_substring_trick_no_longer_matches(dup_tree):
     base = older.stat().st_mtime
     os.utime(newer, (base + 100, base + 100))  # 钉死排序方向，避免同秒 mtime 竞态
 
-    proc = t.run("-d", "A", "B", "--action", "delete", "--retain", "keep")
+    proc = t.run("-d", "A", "B", "--action", "delete", "--retain", "keep", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -210,7 +215,8 @@ def test_retain_file_keywords_use_same_component_matching(dup_tree):
     before = t.snapshot()
     t.add_file("retain_keys.txt", b"dirA\n")
 
-    proc = t.run("-d", "A", "--action", "delete", "--retain-file", "retain_keys.txt")
+    proc = t.run("-d", "A", "--action", "delete", "--retain-file", "retain_keys.txt",
+                 "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -228,7 +234,8 @@ def test_priority_order_path_depth_sorting_component_normalized(dup_tree):
     t.add_file("A/shallow.bin", content)
     t.add_file("A/deep/sub/copy.bin", content)
 
-    proc = t.run("-d", "A", "--action", "delete", "--priority-order", "path")
+    proc = t.run("-d", "A", "--action", "delete", "--priority-order", "path",
+                 "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -245,7 +252,7 @@ def test_priority_order_path_combined_with_retain_shares_matching(dup_tree):
     before = t.snapshot()
 
     proc = t.run("-d", "A", "--action", "delete",
-                 "--priority-order", "path", "--retain", "dirA")
+                 "--priority-order", "path", "--retain", "dirA", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 

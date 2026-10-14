@@ -9,6 +9,10 @@
 
 全部经 CLI 进程边界断言外部行为；不假设重复组内哪一侧被移走——一切以清单实际
 记录的 src/dst 为准。
+
+本套件的重复对全部是异名（p1.txt/p1-copy.txt 等），"确有移动/删除发生"是清单与
+回滚断言的前提，故逐条显式传 --no-gate-renamed 保持原断言语义（gate 本体行为由
+tests/test_renamed_gate.py 覆盖）。
 """
 
 import json
@@ -79,7 +83,7 @@ def test_move_writes_one_manifest_line_per_actual_move(dup_tree):
     _build_pairs(t)
     all_original_rels = [rel for rel_a, rel_b, _ in PAIRS for rel in (rel_a, rel_b)]
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     moved_log = [ln for ln in out.splitlines() if "Moved:" in ln]
@@ -134,7 +138,7 @@ def test_undo_restores_tree_identical_and_prunes_skeleton(dup_tree):
     os.utime(p1, (1234.5, 1234.5))
     before = t.snapshot()
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
     assert t.snapshot() != before                              # 确有文件被移走
     cache_bytes = t.cache_path().read_bytes()
@@ -172,7 +176,7 @@ def test_undo_skips_occupied_src_without_overwriting(dup_tree):
     t = dup_tree
     t.mkdir("trash")
     _build_pairs(t)
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
     _, entries = _read_manifest_entries(t)
 
@@ -208,7 +212,7 @@ def test_undo_counts_missing_when_destination_already_gone(dup_tree):
     t = dup_tree
     t.mkdir("trash")
     _build_pairs(t)
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
 
     victims = moved_payload_files(t.workdir / "trash")
@@ -230,7 +234,7 @@ def test_undo_skips_malformed_manifest_lines_without_crash(dup_tree):
     t = dup_tree
     t.mkdir("trash")
     _build_pairs(t)
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
 
     manifests = sorted((t.workdir / "trash").glob("moves_*.jsonl"))
@@ -259,7 +263,7 @@ def test_undo_recreates_missing_parent_directories(dup_tree):
     os.chmod(a, 0o640)
     os.chmod(b, 0o662)   # 两者各带非常规权限：无论哪个被移走都能验证 mode 保留
 
-    proc = t.run("-d", "D", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "D", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
     moved = moved_payload_files(t.workdir / "trash")
     assert len(moved) == 1
@@ -297,7 +301,7 @@ def test_delete_and_try_run_produce_no_manifest(dup_tree_factory):
     t_del = dup_tree_factory("delete-no-manifest")
     t_del.mkdir("trash")
     _build_pairs(t_del)
-    proc = t_del.run("-d", "A", "B", "--action", "delete", "-m", "trash")
+    proc = t_del.run("-d", "A", "B", "--action", "delete", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert list(t_del.workdir.rglob("moves_*.jsonl")) == []
@@ -306,7 +310,8 @@ def test_delete_and_try_run_produce_no_manifest(dup_tree_factory):
     t_try = dup_tree_factory("tryrun-no-manifest")
     t_try.mkdir("trash")
     _build_pairs(t_try)
-    proc = t_try.run("-d", "A", "B", "--action", "move", "-m", "trash", "--try-run")
+    proc = t_try.run("-d", "A", "B", "--action", "move", "-m", "trash", "--try-run",
+                     "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert list(t_try.workdir.rglob("moves_*.jsonl")) == []
@@ -319,7 +324,7 @@ def test_undo_with_rename_only_move_writes_no_manifest(dup_tree):
     """改名模式（move 不带 --move-to-dir）不产清单——清单只归属回收目录根部。"""
     t = dup_tree
     _build_pairs(t)
-    proc = t.run("-d", "A", "B", "--action", "move")
+    proc = t.run("-d", "A", "B", "--action", "move", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert list(t.workdir.rglob("moves_*.jsonl")) == []
@@ -369,7 +374,7 @@ def test_undo_accepts_single_manifest_file_path(dup_tree):
     t = dup_tree
     t.mkdir("trash")
     _build_pairs(t)
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
     manifest, entries = _read_manifest_entries(t)
 

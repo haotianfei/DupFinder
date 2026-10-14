@@ -49,6 +49,18 @@ A command-line tool that finds and handles duplicate files by size and hash — 
   重复组——以 A 为参照清理 B 时，两侧各自内部的重复都不会被触碰。
 - **执行前审查**：`--export-candidates FILE` 在任何动作前把实际处理队列逐行
   （绝对路径）导出为文本清单；与 `--try-run` 组合即可"只看不动"。
+- **异名重复默认保护**：内容相同但文件名（basename）不同的重复可能各有引用
+  语义（配置路径、应用绑定），"内容重复"≠"引用冗余"。门禁（gate）默认开启：
+  同名重复（跨目录同步副本）照常处理，异名候选移出执行队列并写入
+  `renamed_pending_*.txt` 待审清单（纯文本 TSV 标记格式）。清单为 **opt-out**
+  语义：行默认预标记 `x`（拟执行），保护 = 把标记改成空格/`-` 或直接删行；
+  文件级安全底线是 **body-sha256 未经审阅拒绝门**——清单头部记录正文摘要，
+  未经人工编辑（只改注释不算）的清单被 `--approve` 直接拒绝（rc1 零动作），
+  审阅后全部照批可用 `--approve-all` 零编辑执行；`--approve` 的 move 模式建议
+  与 `-m` 连用——不带 `-m` 时按原地改名处理，不产生清单、无法 `--undo` 回滚。
+  `--approve` 逐条四项校验
+  （存在+size、mtime 告警、内容摘要经缓存、保留项在位）后再执行，
+  `--no-gate-renamed` 可退回旧行为。
 - **可追溯、可回滚的移动**：每条成功的移动都会即时写入回收目录根部的
   `moves_*.jsonl` 清单；`--undo` 按清单反向恢复，原位已被占用则跳过不覆盖，
   结束后清理变空的目录骨架并输出 restored/skipped/missing 计数核对。
@@ -59,7 +71,7 @@ A command-line tool that finds and handles duplicate files by size and hash — 
   传播"——只警示不阻塞。
 - **确定性优先级**：更早修改、路径更深的文件优先保留；`--retain` 关键字按
   完整路径分量（连续分量序列）匹配，`dirA` 永远不会误中兄弟目录 `dirA-nm`。
-- **质量保障**：95 个端到端测试全部经 CLI 进程边界运行，mypy 静态类型检查，
+- **质量保障**：118 个端到端测试全部经 CLI 进程边界运行，mypy 静态类型检查，
   CI 覆盖 push 与 pull request。
 
 ### 快速开始
@@ -90,7 +102,7 @@ python dup_finder.py --undo trash/
 
 ```bash
 pip install -e .[dev]                      # 额外安装 pytest 与 mypy
-python -m pytest tests/ -q                 # 全量 95 例（CLI seam 端到端）
+python -m pytest tests/ -q                 # 全量 118 例（CLI seam 端到端）
 python -m pytest tests/ -q -m "not slow"   # 跳过 slow 标记用例
 python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
 ```
@@ -99,12 +111,12 @@ python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
 
 ### 参数一览
 
-权威清单以 `python dup_finder.py --help` 为准（共 17 个参数，下一节逐字粘贴），
+权威清单以 `python dup_finder.py --help` 为准（共 21 个参数，下一节逐字粘贴），
 本表与之一一对应。
 
 | 参数 | 类型 | 说明 |
 | --- | --- | --- |
-| `-d, --directories` | 除 `--undo` 外必选 | 查找重复文件的目录，可以输入多个目录，以空格分隔 |
+| `-d, --directories` | 除 `--undo`/`--approve` 外必选 | 查找重复文件的目录，可以输入多个目录，以空格分隔 |
 | `--action` | 可选，默认为 `move` | 对重复文件执行的操作，可选值为 `delete` 或 `move` |
 | `--priority-order, -p` | 可选 | 自定义优先级顺序，默认为 `modified_time path`：更早修改的文件优先保留（可能是更有保留价值的原件），路径层级更深的文件优先保留 |
 | `--move-to-dir, -m` | 可选 | 移动文件的目标目录；未指定时就地改名追加 `.dup_finder` 后缀 |
@@ -121,6 +133,10 @@ python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
 | `--duplicates-result-file` | 可选 | 从既有结果 JSON 载入分组继续处理（跳过扫描）；载入前会校验结构，缺 `path`/`priority` 等字段时逐条报错并零动作退出 |
 | `--export-candidates` | 可选（PATH） | 在任何动作执行前，把将被处理的文件清单（绝对源路径，一行一个）写入 PATH，与实际操作队列逐行一致；父目录自动创建；与 `--try-run` 组合即可"只导清单不执行" |
 | `--undo` | 可选（PATH） | 回滚模式：读取 `moves_*.jsonl` 清单（单个文件或含清单的目录），把每条记录从目标位置搬回原位；原位已被占用则跳过不覆盖（保护回滚期间新数据），结束后清理回收目录内变空的目录骨架并打印 restored/skipped_conflict/missing/total 计数。与 `-d` 互斥 |
+| `--no-gate-renamed` | 可选（默认不传 = 门禁保持开启） | 异名重复门禁开关的反向参数：默认门禁开启——候选与组内保留项 basename 不同时移出执行队列、写入待审清单（同名重复照常处理）；传入本参数即恢复旧行为，所有入选候选不经审查直接处理 |
+| `--approve` | 可选（PATH） | 审批模式：执行 `renamed_pending_*.txt` 待审清单中行首恰为 `x` 的行（清单默认预标记 `x`，保护=改空格/`-` 或删行）。第 0 项为文件级审阅门：头部 `# body-sha256:` 记录与正文（所有非 `#` 行按原始字节 `\n` 连接）重算一致 = 未编辑 → rc1 拒绝零动作（只改注释不解锁；缺记录同样拒绝），除非加 `--approve-all`。之后每行四项校验：候选存在且 size 与记录一致（否则 skipped_gone）、mtime 较扫描时点变化仅告警（warn_modified）、内容摘要与记录一致（经哈希缓存，miss 现算；不一致 skipped_mismatch）、保留项仍在位（否则 skipped_kept_gone）；通过后走与主流程一致的 delete/move 通道，move 写标准 `moves_*.jsonl` 清单、可被 `--undo` 回滚，收尾打印 executed/skipped/mismatch/total。与 `-d`/`--undo`/`--duplicates-result-file` 互斥 |
+| `--approve-all` | 可选，默认关闭 | `--approve` 的零编辑逃逸开关：跳过 body-sha256 审阅门，执行清单中全部 `x` 行——显式给出本参数本身即人工审阅声明；被保护（空格/`-`）、被删行与 `!` 病态行依然不执行。必须与 `--approve` 连用，单独使用报 rc2 |
+| `--renamed-pending-prefix` | 可选（PATH） | 待审清单的输出位置（默认与结果 JSON 同目录，即当前工作目录，文件名 `renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt`）：取值为既有目录或以路径分隔符结尾时在该目录内用默认文件名；否则作为文件名前缀 `<PATH>_<时间戳>.txt` |
 
 ### 完整帮助（逐字）
 
@@ -139,6 +155,8 @@ usage: dup_finder.py [-h] [--directories DIRECTORIES [DIRECTORIES ...]]
                      [--retain-file RETAIN_FILE]
                      [--duplicates-result-file DUPLICATES_RESULT_FILE]
                      [--undo PATH] [--export-candidates PATH]
+                     [--no-gate-renamed] [--approve PATH] [--approve-all]
+                     [--renamed-pending-prefix PATH]
 
 Find and process duplicate files.
 
@@ -146,7 +164,7 @@ options:
   -h, --help            show this help message and exit
   --directories, -d DIRECTORIES [DIRECTORIES ...]
                         Directories to search for duplicate files (required
-                        unless --undo is used)
+                        unless --undo or --approve is used)
   --action {delete,move}
                         Action to process files (default: move)
   --priority-order, -p PRIORITY_ORDER [PRIORITY_ORDER ...]
@@ -215,6 +233,55 @@ options:
                         files. The output file is a user-requested artifact;
                         its parent directories are created as needed, and the
                         run stops before acting if the list cannot be written.
+  --no-gate-renamed     Renamed-dupes gate (ON by default): a candidate whose
+                        basename differs from its group's kept file is held
+                        back from delete/move and written to a
+                        renamed_pending_*.txt review file next to the result
+                        JSON; same-name duplicates keep being processed as
+                        before. Rows come pre-marked 'x': protect what to keep
+                        ('x' -> ' ' or '-', or delete the row) and run
+                        --approve; an unedited list is refused (rc1) unless
+                        --approve-all. This flag restores the old behavior of
+                        processing every selected candidate without any
+                        review. (default: gate on)
+  --approve PATH        Approval mode: execute the rows marked 'x' in a
+                        renamed_pending_*.txt review file (PATH). Rows are
+                        generated pre-marked 'x' (opt-out): to protect a file
+                        change its mark to ' ' or '-', or delete the row.
+                        Check 0 is the review gate — a whose-body file nobody
+                        edited ('# body-sha256:' recomputes equal, comment-
+                        only edits do not unlock; a missing record is also
+                        refused) aborts with rc1 and zero actions unless
+                        --approve-all is passed. Every row then passes four
+                        checks before acting: candidate exists with the
+                        recorded size, content digest matches the recorded id
+                        (via the hash cache, re-hashed on miss), and the kept
+                        file is still in place; an mtime change since the
+                        review file was generated only warns. Approved rows go
+                        through the same delete/move machinery (--action move
+                        -m DIR writes a standard moves_*.jsonl manifest that
+                        --undo rolls back). Prints an
+                        executed/skipped/mismatch/total summary. Mutually
+                        exclusive with -d/--directories, --undo and
+                        --duplicates-result-file. Example: sed -i
+                        '/wechat/s/^x/-/' renamed_pending_*.txt &&
+                        dup_finder.py --approve renamed_pending_*.txt --action
+                        move -m trash
+  --approve-all         Skip the body-sha256 review gate of --approve and
+                        execute every 'x' row as generated: passing this flag
+                        is itself the human review declaration for an all-
+                        approve decision. Rows protected (' ' or '-'), deleted
+                        rows and '!' pathological rows still never execute.
+                        Must be combined with --approve PATH; using it alone
+                        is an error (exit code 2)
+  --renamed-pending-prefix PATH
+                        Where the renamed-dupes review file is written
+                        (default: renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt
+                        next to the result JSON, i.e. the working directory).
+                        An existing directory or a value ending in a path
+                        separator keeps the default file name inside it; any
+                        other value is used as a file-name prefix:
+                        <PATH>_<YYYYmmdd_HHMMSS_ffffff>.txt
 ```
 
 ### 运行产物
@@ -223,6 +290,7 @@ options:
 | --- | --- |
 | `file_cache.json`（及 `.lock`） | 哈希缓存，任何非演练运行都可能更新 |
 | `duplicates_YYYYMMDD_HHMMSS.json` | 一次查找结果（`--try-run` 不写） |
+| `renamed_pending_YYYYMMDD_HHMMSS_ffffff.txt` | 异名重复待审清单（门禁拦到异名候选才写，行默认预标记 `x`，头部含 `# body-sha256:` 审阅门记录；`--try-run` 也写，属审查产物） |
 | `<回收目录>/moves_YYYYMMDD_HHMMSS_ffffff.jsonl` | 每条成功移动一行 `{"src", "dst"}`，供 `--undo` 回放 |
 | `logs/DupFinder.log`（按天轮转，保留 3 天） | INFO 里程碑与告警日志 |
 
@@ -273,6 +341,25 @@ options:
    python dup_finder.py -d dir_a/ --hash-algo sha512 --try-run
    ```
 
+9. 异名重复审批闭环（默认门禁，opt-out 标记，上千条也不崩）：
+   ```bash
+   # 1) 照常跑：同名重复已处理，异名候选全部进待审清单、原地不动
+   python dup_finder.py -d dir_a/ dir_b/ --action move -m trash/
+   # 2) 审阅清单（TSV：标记<TAB>候选路径<TAB>保留路径<TAB>sha256<TAB>size，
+   #    行默认已带 'x'=拟执行；直接对未编辑清单 --approve 会被拒绝 rc1）
+   less renamed_pending_*.txt
+   # 3a) 要保护的就改标记或删行：批量保护某目录/模式，或全保护后个别放行
+   sed -i '/keepassxc/s/^x/-/' renamed_pending_20261014_101530_123456.txt
+   vim -c ':g/WeiXin/s/^x/ /' renamed_pending_20261014_101530_123456.txt
+   # 3b) 自审后确认全部照批：零编辑，显式 --approve-all 即为审阅声明
+   # 4) 执行剩余 'x' 行（逐条四项校验），随后仍可一条 --undo 回滚
+   python dup_finder.py --approve renamed_pending_20261014_101530_123456.txt \
+       --action move -m trash/
+   python dup_finder.py --approve renamed_pending_20261014_101530_123456.txt \
+       --approve-all --action delete
+   python dup_finder.py --undo trash/
+   ```
+
 ### 事后微调优先级
 
 在把结果文件经 `--duplicates-result-file` 回喂处理前，可用
@@ -305,17 +392,22 @@ python change_priority.py -i duplicates.json -o adjusted.json -p archive_2024 -a
 
 - 对疑似活跃同步目录执行移动/删除会向对端设备传播，工具会在动作前警示
   （扫描根下存在 `.stfolder` / `.sync` 标记时），请留意日志。
+- 异名重复门禁默认开启：内容相同但 basename 不同的候选只进待审清单、不被
+  自动处理。清单行默认预标记 `x`（opt-out）：审阅时把要保留的改成空格/`-` 或
+  删行即可；未经人工编辑的清单会被 `--approve` 直接拒绝（rc1，只改注释不算
+  审阅），确认全批用 `--approve-all`。`--approve` 对每条已批准行重新校验
+  存在性/大小/摘要与保留项在位后才动文件。
 - 首轮正式运行前建议先演练并导出清单审查；确认结果前保留回收目录。
 
 ### 目录结构
 
 | 路径 | 职责 |
 | --- | --- |
-| `dup_finder.py` | 主程序：两阶段扫描、哈希缓存、动作执行、移动清单与回滚 |
+| `dup_finder.py` | 主程序：两阶段扫描、哈希缓存、异名门禁与待审清单、动作执行、移动清单与回滚 |
 | `pathlogic.py` | 纯函数：路径分量匹配、结果文件结构校验，导入零副作用 |
 | `logger.py` | 统一日志配置：控制台 INFO 里程碑 + 按天轮转的文件日志 |
 | `change_priority.py` | 独立脚本：回喂处理前微调结果 JSON 中的优先级 |
-| `tests/` | 端到端测试（仅经 CLI 进程边界驱动，95 用例） |
+| `tests/` | 端到端测试（仅经 CLI 进程边界驱动，118 用例） |
 
 ### 贡献、更新日志与许可证
 
@@ -370,6 +462,23 @@ and an incremental hash cache makes repeat runs cheap.
 - **Review before acting.** `--export-candidates FILE` dumps the exact
   processing queue (one absolute path per line) before any action runs; combine
   with `--try-run` to review without touching anything.
+- **Renamed-duplicate protection by default.** Identical content under a
+  different basename can carry different reference semantics (config paths,
+  application bindings) — "duplicate content" is not "redundant reference".
+  The gate is ON by default: same-name duplicates (synchronized copies) keep
+  being processed, while renamed candidates leave the execution queue and land
+  in a `renamed_pending_*.txt` review file (plain-text TSV mark format). The
+  file is **opt-out**: rows come pre-marked `x` (intended for processing), and
+  protecting means flipping the mark to ' ' or `-` or deleting the row. The
+  file-level body-sha256 review gate is the safety floor — the header records
+  a digest of the body, and `--approve` refuses (rc1, zero actions) against a
+  list nobody edited (comment-only changes do not unlock); once reviewed,
+   accepting every row is a zero-edit `--approve-all`; pair `--approve` moves
+   with `-m` — without it the move degrades to an in-place rename with no
+   manifest and no `--undo` rollback. `--approve` re-verifies
+  every row with four checks (existence + size, mtime warning, digest via the
+  cache, kept file still in place) before touching anything;
+  `--no-gate-renamed` restores the old behavior.
 - **Auditable, reversible moves.** Every successful move is appended to a
   `moves_*.jsonl` manifest at the root of the recycle dir; `--undo` replays a
   manifest backwards, never overwriting an occupied original location, pruning
@@ -384,7 +493,7 @@ and an incremental hash cache makes repeat runs cheap.
 - **Deterministic priorities.** Earlier-modified files and deeper paths are
   kept first; `--retain` keywords match whole path components (contiguous
   component runs), so `dirA` can never accidentally match a sibling `dirA-nm`.
-- **Quality rails.** 95 end-to-end tests at the CLI process boundary, static
+- **Quality rails.** 118 end-to-end tests at the CLI process boundary, static
   type checking with mypy, CI on push and pull requests.
 
 ### Quickstart
@@ -415,7 +524,7 @@ the [CLI table](#cli-reference) below.
 
 ```bash
 pip install -e .[dev]                      # adds pytest and mypy
-python -m pytest tests/ -q                 # full suite (95 tests, CLI seam)
+python -m pytest tests/ -q                 # full suite (118 tests, CLI seam)
 python -m pytest tests/ -q -m "not slow"   # skip the marked slow cases
 python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
 ```
@@ -424,12 +533,12 @@ Requires Python 3.11 or newer (`hashlib.file_digest`).
 
 ### CLI reference
 
-The authoritative list is `python dup_finder.py --help` (17 options, pasted
+The authoritative list is `python dup_finder.py --help` (21 options, pasted
 verbatim in the next section); this table mirrors it 1:1.
 
 | Parameter | Kind | Description |
 | --- | --- | --- |
-| `-d, --directories` | required unless `--undo` | Directories to search for duplicate files; several may be given, space-separated |
+| `-d, --directories` | required unless `--undo`/`--approve` | Directories to search for duplicate files; several may be given, space-separated |
 | `--action` | optional, default `move` | What to do with duplicate files: `delete` or `move` |
 | `--priority-order, -p` | optional | Custom priority order; default `modified_time path` — earlier-modified files are kept first (likely the originals worth keeping), and deeper paths win within a group |
 | `--move-to-dir, -m` | optional | Destination directory for moves; without it, files are renamed in place with a `.dup_finder` suffix |
@@ -446,6 +555,10 @@ verbatim in the next section); this table mirrors it 1:1.
 | `--duplicates-result-file` | optional | Load groups from an existing result JSON and continue (skipping the scan); the file is schema-checked first — missing `path`/`priority` fields produce located errors and a zero-action exit |
 | `--export-candidates` | optional (PATH) | Before any action, write the pending-processing list (one absolute source path per line) to PATH, line-for-line identical to the real queue; parent directories are created; pair with `--try-run` for review-only use |
 | `--undo` | optional (PATH) | Rollback mode: replay `moves_*.jsonl` manifests (one file, or a directory holding them), moving each entry back from destination to source; occupied original locations are skipped and never overwritten, emptied recycle-dir skeletons are pruned, and a restored/skipped_conflict/missing/total summary is printed. Mutually exclusive with `-d` |
+| `--no-gate-renamed` | optional, omit to keep gate on | Inverse switch of the renamed-dupes gate: by default a candidate whose basename differs from its group's kept file leaves the execution queue and is written to the review file (same-name duplicates keep being processed); passing this flag restores the old behavior of processing every selected candidate without review |
+| `--approve` | optional (PATH) | Approval mode: execute rows whose leading mark is exactly `x` in a `renamed_pending_*.txt` review file. Rows are generated pre-marked `x` (opt-out): protect by flipping the mark to ' ' or `-`, or delete the row. Check 0 is the file-level review gate — recomputing the body digest (all non-`#` lines, raw bytes joined with `\\n`) equals the recorded `# body-sha256:` means nobody edited the list (comment-only changes do not unlock) → rc1, zero actions, unless `--approve-all`; a missing record is refused the same way. Each row then passes four checks before acting: candidate exists with the recorded size (else skipped_gone), mtime drift since the scan only warns (warn_modified), content digest matches via the hash cache or a fresh hash (else skipped_mismatch), kept file still in place (else skipped_kept_gone); approved rows use the same delete/move machinery, moves write a standard `moves_*.jsonl` manifest that `--undo` rolls back, and an executed/skipped/mismatch/total summary is printed. Mutually exclusive with `-d`/`--undo`/`--duplicates-result-file` |
+| `--approve-all` | optional, off | Zero-edit escape hatch for `--approve`: skip the body-sha256 review gate and execute every `x` row — passing the flag is itself the human review declaration; protected (' '/'-'), deleted and `!` pathological rows still never execute. Must be combined with `--approve`; alone it errors (rc2) |
+| `--renamed-pending-prefix` | optional (PATH) | Where the review file is written (default: `renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt` next to the result JSON, i.e. the working directory); an existing directory or trailing-separator value keeps the default name inside it, any other value becomes a file-name prefix `<PATH>_<timestamp>.txt` |
 
 ### Full help output
 
@@ -464,6 +577,8 @@ usage: dup_finder.py [-h] [--directories DIRECTORIES [DIRECTORIES ...]]
                      [--retain-file RETAIN_FILE]
                      [--duplicates-result-file DUPLICATES_RESULT_FILE]
                      [--undo PATH] [--export-candidates PATH]
+                     [--no-gate-renamed] [--approve PATH] [--approve-all]
+                     [--renamed-pending-prefix PATH]
 
 Find and process duplicate files.
 
@@ -471,7 +586,7 @@ options:
   -h, --help            show this help message and exit
   --directories, -d DIRECTORIES [DIRECTORIES ...]
                         Directories to search for duplicate files (required
-                        unless --undo is used)
+                        unless --undo or --approve is used)
   --action {delete,move}
                         Action to process files (default: move)
   --priority-order, -p PRIORITY_ORDER [PRIORITY_ORDER ...]
@@ -540,6 +655,55 @@ options:
                         files. The output file is a user-requested artifact;
                         its parent directories are created as needed, and the
                         run stops before acting if the list cannot be written.
+  --no-gate-renamed     Renamed-dupes gate (ON by default): a candidate whose
+                        basename differs from its group's kept file is held
+                        back from delete/move and written to a
+                        renamed_pending_*.txt review file next to the result
+                        JSON; same-name duplicates keep being processed as
+                        before. Rows come pre-marked 'x': protect what to keep
+                        ('x' -> ' ' or '-', or delete the row) and run
+                        --approve; an unedited list is refused (rc1) unless
+                        --approve-all. This flag restores the old behavior of
+                        processing every selected candidate without any
+                        review. (default: gate on)
+  --approve PATH        Approval mode: execute the rows marked 'x' in a
+                        renamed_pending_*.txt review file (PATH). Rows are
+                        generated pre-marked 'x' (opt-out): to protect a file
+                        change its mark to ' ' or '-', or delete the row.
+                        Check 0 is the review gate — a whose-body file nobody
+                        edited ('# body-sha256:' recomputes equal, comment-
+                        only edits do not unlock; a missing record is also
+                        refused) aborts with rc1 and zero actions unless
+                        --approve-all is passed. Every row then passes four
+                        checks before acting: candidate exists with the
+                        recorded size, content digest matches the recorded id
+                        (via the hash cache, re-hashed on miss), and the kept
+                        file is still in place; an mtime change since the
+                        review file was generated only warns. Approved rows go
+                        through the same delete/move machinery (--action move
+                        -m DIR writes a standard moves_*.jsonl manifest that
+                        --undo rolls back). Prints an
+                        executed/skipped/mismatch/total summary. Mutually
+                        exclusive with -d/--directories, --undo and
+                        --duplicates-result-file. Example: sed -i
+                        '/wechat/s/^x/-/' renamed_pending_*.txt &&
+                        dup_finder.py --approve renamed_pending_*.txt --action
+                        move -m trash
+  --approve-all         Skip the body-sha256 review gate of --approve and
+                        execute every 'x' row as generated: passing this flag
+                        is itself the human review declaration for an all-
+                        approve decision. Rows protected (' ' or '-'), deleted
+                        rows and '!' pathological rows still never execute.
+                        Must be combined with --approve PATH; using it alone
+                        is an error (exit code 2)
+  --renamed-pending-prefix PATH
+                        Where the renamed-dupes review file is written
+                        (default: renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt
+                        next to the result JSON, i.e. the working directory).
+                        An existing directory or a value ending in a path
+                        separator keeps the default file name inside it; any
+                        other value is used as a file-name prefix:
+                        <PATH>_<YYYYmmdd_HHMMSS_ffffff>.txt
 ```
 
 ### Generated files
@@ -548,6 +712,7 @@ options:
 | --- | --- |
 | `file_cache.json` (+ `.lock`) | Hash cache, updated by any non-dry run |
 | `duplicates_YYYYMMDD_HHMMSS.json` | Result of each real scan (`--try-run` writes none) |
+| `renamed_pending_YYYYMMDD_HHMMSS_ffffff.txt` | Renamed-duplicate review file — rows pre-marked `x` (opt-out), header carries the `# body-sha256:` review-gate record; only written when the gate holds something back, also under `--try-run` (review artifact) |
 | `<recycle dir>/moves_YYYYMMDD_HHMMSS_ffffff.jsonl` | One `{"src", "dst"}` line per completed move, for `--undo` |
 | `logs/DupFinder.log` (daily rotation, 3 days kept) | INFO milestones and warnings |
 
@@ -601,6 +766,28 @@ options:
    python dup_finder.py -d dir_a/ --hash-algo sha512 --try-run
    ```
 
+9. Renamed-duplicate approval loop (the default gate; opt-out marks, scales to
+   thousands):
+   ```bash
+   # 1) Run as usual: same-name duplicates are processed, renamed candidates
+   #    all land in the review file (pre-marked 'x') and stay in place.
+   python dup_finder.py -d dir_a/ dir_b/ --action move -m trash/
+   # 2) Review the TSV: mark <TAB> candidate <TAB> kept <TAB> sha256 <TAB> size
+   #    --approve on an unedited list is refused (rc1); comment-only edits do
+   #    not unlock it.
+   less renamed_pending_*.txt
+   # 3a) Protect what must stay: flip marks (pattern batch or every row), or delete rows
+   sed -i '/keepassxc/s/^x/-/' renamed_pending_20261014_101530_123456.txt
+   vim -c ':g/WeiXin/s/^x/ /' renamed_pending_20261014_101530_123456.txt
+   # 3b) Reviewed and everything may go: zero-edit all-approve escape hatch
+   # 4) Execute the remaining 'x' rows (four checks each); --undo still rolls back
+   python dup_finder.py --approve renamed_pending_20261014_101530_123456.txt \
+       --action move -m trash/
+   python dup_finder.py --approve renamed_pending_20261014_101530_123456.txt \
+       --approve-all --action delete
+   python dup_finder.py --undo trash/
+   ```
+
 ### Adjusting priorities afterwards
 
 `change_priority.py` edits the `priority` numbers inside a generated
@@ -638,6 +825,14 @@ python change_priority.py -i duplicates.json -o adjusted.json -p archive_2024 -a
   change to peer devices. DupFinder warns before actions when a scan root
   contains synchronization markers such as `.stfolder` / `.sync`; heed the
   warning.
+- The renamed-dupes gate is ON by default: identical content under a different
+  basename only ever lands in the review file and is never auto-processed.
+  Rows are pre-marked `x` (opt-out) — protect by flipping the mark to ' ' or
+  `-` or deleting the row — and a list nobody edited is refused by
+  `--approve` (rc1) via the body-sha256 review gate (comment-only edits do not
+  unlock); use `--approve-all` for a zero-edit all-approve. `--approve`
+  re-verifies existence/size, digest and the kept file in place before
+  touching each approved row.
 - Prefer `--try-run` plus `--export-candidates` review before the first real
   pass, and keep the recycle dir until `--undo` confirmed the outcome.
 
@@ -645,11 +840,11 @@ python change_priority.py -i duplicates.json -o adjusted.json -p archive_2024 -a
 
 | Path | Role |
 | --- | --- |
-| `dup_finder.py` | Main CLI: two-phase scan, hash cache, actions, manifests, rollback |
+| `dup_finder.py` | Main CLI: two-phase scan, hash cache, renamed gate and review file, actions, manifests, rollback |
 | `pathlogic.py` | Pure functions: path-component matching, result-file schema validation, zero import side effects |
 | `logger.py` | Shared logging setup: console INFO milestones plus a rotating file log |
 | `change_priority.py` | Standalone utility to tune priorities in a result JSON before reprocessing |
-| `tests/` | 95 end-to-end tests driven purely through the CLI process boundary |
+| `tests/` | 118 end-to-end tests driven purely through the CLI process boundary |
 
 ### Contributing, changelog and license
 
