@@ -1,0 +1,63 @@
+name: 🐞 Bug report · 缺陷反馈
+description: Report a reproducible problem with DupFinder · 报告一个可复现的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this! 感谢抽出时间反馈！
+        Please try a minimal reproduction with `--try-run` first — it changes
+        nothing on disk and usually makes the problem easy to isolate.
+        请先用 `--try-run` 演练模式收敛一个最小复现——它不改动任何文件，通常也足以定位问题。
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened · 问题现象
+      description: Actual behavior vs what you expected · 实际行为与预期行为
+      placeholder: Briefly describe the problem. 简要描述问题。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction · 复现步骤
+      description: >-
+        The exact command line, plus a minimal directory layout (use neutral
+        example names such as dir_a/, dir_b/; redact personal paths before
+        pasting). 完整命令行与最小目录结构（示例请用中性名称如 dir_a/、dir_b/，
+        粘贴前删除个人路径）。
+      render: shell
+      placeholder: |
+        python dup_finder.py -d dir_a/ dir_b/ --action move -m trash/
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment · 运行环境
+      description: OS, Python version, DupFinder version or commit · 操作系统、Python 版本、程序版本
+      value: |
+        - OS / 操作系统:
+        - Python:
+        - DupFinder version or commit / 版本或提交:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines · 相关日志
+      description: >-
+        Milestone or warning lines from the console or logs/DupFinder.log.
+        Redact any personal paths first. 控制台或 logs/DupFinder.log 中的
+        里程碑/告警行；粘贴前请删除个人路径。
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting · 提交前确认
+      options:
+        - label: I redacted personal paths and sensitive data · 已删除个人路径与敏感信息
+          required: true
+        - label: I searched existing issues for duplicates · 已搜索过相似 issue

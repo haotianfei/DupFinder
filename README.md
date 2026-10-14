@@ -1,60 +1,177 @@
 # DupFinder
 
-## 简介
-`DupFinder` 是一个用于查找并处理重复文件的 Python 工具。它可以通过计算文件的哈希值来识别重复文件，并根据指定的保留优先级规则（修改时间、路径等）保留唯一文件，同时根据需求对其他重复文件执行删除或移动操作。
+[![License: GPL v3](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
+[![CI](https://github.com/haotianfei/DupFinder/actions/workflows/ci.yml/badge.svg)](https://github.com/haotianfei/DupFinder/actions/workflows/ci.yml)
 
-## 功能特性
-- **查找重复文件**：按大小与哈希值（默认 SHA-256，可切换算法）识别重复文件。哈希值相同但大小不同的极端情形（摘要碰撞，极罕见）以警告呈现并整组保留，交人工甄别。
-- **大小预过滤**：先按文件大小分组，仅大小相同的候选才计算哈希；大小全局唯一的文件不读内容，其缓存条目记录专用哨兵值，后续运行继续短路。
-- **扫描安全基线**：0 字节文件与软链接默认不参与去重（`--min-size` 可一般化）；单个不可读或中途消失的文件只产生一条警告并继续整轮扫描。
-- **保留文件关键字过滤**：`--retain` 按路径分量匹配——关键字须等于某个完整路径分量、或作为连续分量序列出现；例如 `dirA` 命中 `dirA/...` 下的文件，但不会命中兄弟目录 `dirA-nm/...`。
-- **排除关键字过滤**：`--exclude` 按路径子串匹配，命中的文件在扫描阶段即排除。
-- **跨目录专属去重**：`--cross-dirs-only` 只处理成员分布在两个及以上扫描根之间的重复组，目录自身内部的重复整组跳过。
-- **执行前审查**：`--export-candidates` 在任何动作前把"将被处理的文件"逐行导出为纯文本清单，与实际处理队列逐行一致；可配合 `--try-run` 只导清单不执行。
-- **可回滚的移动**：使用 `--move-to-dir` 的移动会把每条成功移动即时记入回收目录根部的 `moves_<时间戳>.jsonl` 清单；`--undo` 按清单反向恢复，原位已被占用则跳过不覆盖，并清理空目录骨架、输出计数核对。
-- **哈希缓存**：`file_cache.json` 批量写（`--cache-batch`），原子替换落盘；中断（Ctrl-C / SIGTERM）时已算好的条目不丢；缓存条目按哈希算法命名空间隔离，默认 sha256 与既有历史条目逐字节兼容。
-- **同步目录警示**：扫描根的直接子项含常见外部同步工具的目录标记（`.stfolder`、`.sync` 前缀）时，在处理动作前打印"移动/删除会向对端设备传播"警示——只提示不阻塞。
-- **日志**：控制台输出 INFO 级里程碑；扫描按每 1000 个文件一条进度记录，不再有每文件级日志；文件日志保存在 `logs/DupFinder.log`（按天轮转，保留 3 天）。
-- **生成文件**：程序执行时可能生成以下文件：
-  - `file_cache.json`：哈希缓存，供后续运行免重算；
-  - `duplicates_YYYYMMDD_HHMMSS.json`：每次查找结果（`--try-run` 不写）；
-  - `<回收目录>/moves_YYYYMMDD_HHMMSS_ffffff.jsonl`：移动清单（仅实际发生移动时产生，供 `--undo` 使用）。
 
-## 技术栈
-- 编程语言：Python 3.11+（哈希流式读取使用 `hashlib.file_digest`）
-- 主要模块：`os`, `sys`, `json`, `glob`, `stat`, `shutil`, `signal`, `hashlib`, `tempfile`, `argparse`, `subprocess`, `datetime`, `time`, `logging`
-- 第三方依赖：`filelock`
+**English** · [中文](#中文)
 
-## 安装
-1. 克隆仓库：
-   ```bash
-   git clone https://github.com/your-repo/dup_finder.git
-   cd dup_finder
-   ```
+---
 
-2. 安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
-   或连同开发依赖以可编辑方式安装（含 pytest 测试入口）：
-   ```bash
-   pip install -e .[dev]
-   ```
+## Overview
 
-3. 运行测试：
-   ```bash
-   python -m pytest            # 全量；快速档可加 -m "not slow"
-   ```
+`DupFinder` is a command-line tool that finds and processes duplicate files by
+file size and cryptographic hash. It keeps one file per duplicate group — chosen
+by deterministic priority rules (modification time, path depth, retain
+keywords) — and deletes or moves the rest. Large trees are handled with a
+two-phase size pre-filter so that only plausible candidates are ever hashed,
+and an incremental hash cache makes repeat runs cheap.
 
-## 使用方法
-### 命令行参数
-`DupFinder` 提供了多种命令行参数以满足不同需求：
+### Features
 
-| 参数 | 类型 | 描述 |
+- **Two-phase size pre-filter.** A scan first groups entries by byte size with
+  a single `stat` per path; only files sharing a size with at least one other
+  candidate are ever hashed. Size-unique files are recorded with a cache
+  sentinel and their content is never read.
+- **Incremental hash cache.** Results are cached in `file_cache.json` (same
+  directory as the run). Writes are atomic, batched, and interrupt-safe: a
+  `SIGINT`/`SIGTERM` still flushes completed work before exiting, and a
+  `--try-run` writes no cache or result files at all.
+- **Cross-directory-only mode.** `--cross-dirs-only` acts only on duplicate
+  groups whose members span two or more scan roots, so cleaning tree B against
+  reference tree A never touches either tree's own internal duplicates.
+- **Review before acting.** `--export-candidates FILE` dumps the exact
+  processing queue (one absolute path per line) before any action runs; combine
+  with `--try-run` to review without touching anything.
+- **Auditable, reversible moves.** Every successful move is appended to a
+  `moves_*.jsonl` manifest at the root of the recycle dir; `--undo` replays a
+  manifest backwards, never overwriting an occupied original location, pruning
+  emptied directory skeletons, and reporting restored/skipped/missing totals.
+- **Scan-safety baseline.** 0-byte files and symlinks never become duplicate
+  candidates (generalized by `--min-size`); an unreadable or vanished file is
+  one warning line, never an aborted run.
+- **Synchronized-folder awareness.** When a scan root directly contains common
+  third-party file-synchronization markers (`.stfolder`, `.sync` prefixes), a
+  warning states that move/delete actions propagate to peer devices — advisory
+  only, the run continues.
+- **Deterministic priorities.** Earlier-modified files and deeper paths are
+  kept first; `--retain` keywords match whole path components (contiguous
+  component runs), so `dirA` can never accidentally match a sibling `dirA-nm`.
+- **Quality rails.** 95 end-to-end tests at the CLI process boundary, static
+  type checking with mypy, CI on push and pull requests.
+
+### Quickstart
+
+```bash
+git clone https://github.com/haotianfei/DupFinder.git
+cd DupFinder
+pip install -e .            # runtime dependency: filelock
+
+# 1) Review first — export the pending list, touch nothing:
+python dup_finder.py -d dir_a/ dir_b/ --cross-dirs-only \
+    --export-candidates pending.txt --try-run
+less pending.txt
+
+# 2) Act — move files of dir_b that duplicate dir_a into a recycle dir;
+#    dir_a and dir_b's own internal duplicates stay untouched:
+python dup_finder.py -d dir_a/ dir_b/ --cross-dirs-only \
+    --action move -m trash/
+
+# 3) If anything went wrong — one command rolls it back:
+python dup_finder.py --undo trash/
+```
+
+Run `python dup_finder.py --help` for the full parameter reference, or jump to
+the [CLI table](#cli-reference) below.
+
+### Install, test, type-check
+
+```bash
+pip install -e .[dev]                  # adds pytest and mypy
+python -m pytest tests/ -q             # full suite (95 tests, CLI seam)
+python -m pytest tests/ -q -m "not slow"   # skip the marked slow cases
+python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
+```
+
+Requires Python 3.11 or newer (`hashlib.file_digest`).
+
+---
+
+<a name="中文"></a>
+
+# DupFinder（中文）
+
+## 概述
+
+`DupFinder` 是一个按文件大小与哈希查找并处理重复文件的命令行工具。每个重复组
+仅保留一个文件（由确定性的优先级规则决定：修改时间、路径深度、保留关键字），
+其余文件被删除或移动。大规模目录采用两阶段大小预过滤，只有存在同大小候选的文件
+才会被计算哈希；增量哈希缓存让重复运行非常便宜。
+
+### 特性
+
+- **两阶段大小预过滤**：扫描先对每个路径仅 stat 一次并按字节大小分组，只有与
+  其他候选同大小的文件才进入哈希阶段；大小全局唯一的文件不读内容，缓存中以专用
+  哨兵值记录。
+- **增量哈希缓存**：结果缓存于运行目录的 `file_cache.json`。写入为原子替换、
+  批量落盘且抗中断：`SIGINT`/`SIGTERM` 时会把已完成部分先落盘再退出；
+  `--try-run` 演练模式完全不写缓存与结果文件。
+- **跨目录专属去重**：`--cross-dirs-only` 只处理成员分布在两个及以上扫描根的
+  重复组——以 A 为参照清理 B 时，两侧各自内部的重复都不会被触碰。
+- **执行前审查**：`--export-candidates FILE` 在任何动作前把实际处理队列逐行
+  （绝对路径）导出为文本清单；与 `--try-run` 组合即可"只看不动"。
+- **可追溯、可回滚的移动**：每条成功的移动都会即时写入回收目录根部的
+  `moves_*.jsonl` 清单；`--undo` 按清单反向恢复，原位已被占用则跳过不覆盖，
+  结束后清理变空的目录骨架并输出 restored/skipped/missing 计数核对。
+- **扫描安全基线**：0 字节文件与软链接默认不参与去重（`--min-size` 可
+  一般化）；单个不可读或中途消失的文件只产生一条警告，不会中断整轮扫描。
+- **同步目录警示**：扫描根直接子项含常见第三方文件同步工具的目录标记
+  （`.stfolder`、`.sync` 前缀）时，在处理动作前提示"移动/删除会向对端设备
+  传播"——只警示不阻塞。
+- **确定性优先级**：更早修改、路径更深的文件优先保留；`--retain` 关键字按
+  完整路径分量（连续分量序列）匹配，`dirA` 永远不会误中兄弟目录 `dirA-nm`。
+- **质量保障**：95 个端到端测试全部经 CLI 进程边界运行，mypy 静态类型检查，
+  CI 覆盖 push 与 pull request。
+
+### 快速开始
+
+与上方 [Quickstart](#quickstart) 相同（示例路径 `dir_a/ dir_b/` 为中性占位）：
+
+```bash
+pip install -e .
+
+# 1) 先审查：导出待处理清单，零改动
+python dup_finder.py -d dir_a/ dir_b/ --cross-dirs-only \
+    --export-candidates pending.txt --try-run
+less pending.txt
+
+# 2) 再执行：把 dir_b 中与 dir_a 重复的文件移入回收目录，
+#    dir_a 自身与 dir_b 内部重复都不动
+python dup_finder.py -d dir_a/ dir_b/ --cross-dirs-only \
+    --action move -m trash/
+
+# 3) 万一有误操作，一条命令回滚
+python dup_finder.py --undo trash/
+```
+
+### 安装、测试与类型检查
+
+```bash
+pip install -e .[dev]                  # 额外安装 pytest 与 mypy
+python -m pytest tests/ -q             # 全量 95 例（CLI seam 端到端）
+python -m pytest tests/ -q -m "not slow"   # 跳过 slow 标记用例
+python -m mypy dup_finder.py logger.py pathlogic.py change_priority.py
+```
+
+要求 Python 3.11 及以上（依赖 `hashlib.file_digest`）。
+
+---
+
+<a name="cli-reference"></a>
+
+## CLI Reference · 参数一览
+
+The authoritative list is `python dup_finder.py --help` (17 options; output
+reproduced verbatim further below). The table mirrors it 1:1.
+权威清单以 `python dup_finder.py --help` 为准（共 17 个参数，下方逐字粘贴）；
+本表与之一一对应。
+
+| Parameter 参数 | Type 类型 | Description 描述 |
 | --- | --- | --- |
 | `-d, --directories` | 除 `--undo` 外必选 | 查找重复文件的目录，可以输入多个目录，以空格分隔 |
 | `--action` | 可选，默认为 `move` | 对重复文件执行的操作，可选值为 `delete` 或 `move` |
-| `--priority-order, -p` | 可选 | 自定义优先级顺序，默认为 `modified_time path`：更早修改的文件优先保留（可能是更有保留价值的原件），路径层级更深的文件优先保留（更细的整理位置） |
+| `--priority-order, -p` | 可选 | 自定义优先级顺序，默认为 `modified_time path`：更早修改的文件优先保留（可能是更有保留价值的原件），路径层级更深的文件优先保留 |
 | `--move-to-dir, -m` | 可选 | 移动文件的目标目录；未指定时就地改名追加 `.dup_finder` 后缀 |
 | `--try-run, -n` | 可选 | 尝试运行模式：仅打印操作，不实际执行，也不写哈希缓存与结果文件 |
 | `--min-size` | 可选，默认 1（字节） | 参与重复判定的最小文件字节数；更小的文件（默认即 0 字节文件）在扫描阶段跳过并计入汇总 |
@@ -70,18 +187,8 @@
 | `--export-candidates` | 可选（PATH） | 在任何动作执行前，把将被处理的文件清单（绝对源路径，一行一个）写入 PATH，与实际操作队列逐行一致；父目录自动创建；与 `--try-run` 组合即可"只导清单不执行" |
 | `--undo` | 可选（PATH） | 回滚模式：读取 `moves_*.jsonl` 清单（单个文件或含清单的目录），把每条记录从目标位置搬回原位；原位已被占用则跳过不覆盖（保护回滚期间新数据），结束后清理回收目录内变空的目录骨架并打印 restored/skipped_conflict/missing/total 计数。与 `-d` 互斥 |
 
-### 文件移动增强功能
-- **完整路径保存**：目标目录下会创建以 `file_id` 命名的子目录，并保留原始文件的完整目录结构
-- **彻底解决文件名长度限制**：通过保持原始文件名和目录结构，完全规避操作系统对文件名长度（255字节）的限制
-- **空间检查机制**：移动前自动检查目标目录可用空间（`--min-free-percent`），避免因空间不足导致操作失败
-- **可追溯与可回滚**：每条成功移动即时写入 `moves_*.jsonl`（`{"src": ..., "dst": ...}`），`--undo` 一键恢复
+### Full help output · 完整帮助（逐字）
 
-### 优先级排序规则
-- **修改时间排序**：更早修改的文件具有更高优先级（保留价值更高的原件通常更早定稿）
-- **路径深度优先**：路径层级更深的文件优先保留
-- **保留关键字规则**：命中 `--retain`/`--retain-file` 的文件始终具有最高优先级（0）
-
-### 命令行帮助
 ```
 $ python dup_finder.py --help
 usage: dup_finder.py [-h] [--directories DIRECTORIES [DIRECTORIES ...]]
@@ -153,9 +260,9 @@ options:
                         File containing retain keywords, one per line
   --duplicates-result-file DUPLICATES_RESULT_FILE
                         File containing the duplicates result JSON data
-  --undo PATH           Rollback mode: replay a moves_*.jsonl manifest (a
-                        file path, or a directory containing them) and move
-                        each recorded file from its destination back to its
+  --undo PATH           Rollback mode: replay a moves_*.jsonl manifest (a file
+                        path, or a directory containing them) and move each
+                        recorded file from its destination back to its
                         original source. Never overwrites a source location
                         that is already occupied, prunes emptied directory
                         skeletons under the recycle dir, and prints a
@@ -175,14 +282,75 @@ options:
                         run stops before acting if the list cannot be written.
 ```
 
-## 调整优先级工具
-我们提供 `change_priority.py` 用于对生成的 duplicates.json 进行优先级微调：
+## Generated files · 运行产物
 
-### 使用场景
-当自动设置的优先级不符合预期时，可通过路径关键字批量调整优先级值（数值越小优先级越高）。关键字匹配与 `--retain` 同语义（按路径分量）。
+| File 文件 | Written when 何时产生 |
+| --- | --- |
+| `file_cache.json` (+ `.lock`) | 哈希缓存，任何非演练运行都可能更新；cache of hashes and sizes, updated by real scans |
+| `duplicates_YYYYMMDD_HHMMSS.json` | 一次查找结果（`--try-run` 不写）；result of each real scan |
+| `<recycle dir>/moves_YYYYMMDD_HHMMSS_ffffff.jsonl` | 每条成功移动一行 `{"src", "dst"}`，供 `--undo`；one line per completed move |
+| `logs/DupFinder.log`（按天轮转，保留 3 天） | INFO 里程碑与告警；milestone and warning logs |
 
-### 命令行参数
-```bash
+## Examples · 使用示例
+
+1. Move duplicates into a recycle dir (with manifest + rollback available)
+   移动到回收目录（随数据生成清单，可回滚）：
+   ```bash
+   python dup_finder.py -d dir_a/ dir_b/ --action move -m trash/
+   python dup_finder.py --undo trash/
+   ```
+
+2. Keep files under a directory component `important`
+   保留路径分量含 `important` 的文件（分量精确匹配）：
+   ```bash
+   python dup_finder.py -d dir_a/ --retain important --action delete
+   ```
+
+3. Custom priority order · 自定义优先级：
+   ```bash
+   python dup_finder.py -d dir_a/ --priority-order modified_time path --action move
+   ```
+
+4. Dry run · 演练：
+   ```bash
+   python dup_finder.py -d dir_a/ --try-run
+   python dup_finder.py -d dir_a/ -n        # short form 简写
+   ```
+
+5. Exclude keywords · 排除关键字（子串匹配）：
+   ```bash
+   python dup_finder.py -d dir_a/ --exclude temp --exclude pdf
+   python dup_finder.py -d dir_a/ --exclude-file exclude_keywords.txt
+   ```
+
+6. Review-only list export · 只导清单不执行：
+   ```bash
+   python dup_finder.py -d dir_a/ dir_b/ --action move -m trash/ \
+       --export-candidates review_list.txt --try-run
+   ```
+
+7. Cross-directory-only cleanup · 跨目录专属清理：
+   ```bash
+   python dup_finder.py -d dir_a/ dir_b/ --cross-dirs-only \
+       --action move -m trash/
+   ```
+
+8. Stricter digest algorithm (cache stays namespaced) · 更严格摘要算法
+   （缓存按算法隔离，sha256 历史不受影响）：
+   ```bash
+   python dup_finder.py -d dir_a/ --hash-algo sha512 --try-run
+   ```
+
+## Adjusting priorities afterwards · 事后微调优先级
+
+`change_priority.py` edits the `priority` numbers inside a generated
+`duplicates_*.json` before you feed it back via `--duplicates-result-file`.
+Key matching uses the same whole-component rule as `--retain`; input is
+schema-checked first (missing `path`/`priority` → readable located errors, no
+crash). 在把结果文件经 `--duplicates-result-file` 回喂处理前，用它微调每组
+`priority`：关键字匹配与 `--retain` 同为分量语义，载入先做结构校验。
+
+```
 $ python change_priority.py --help
 usage: change_priority.py [-h] -i INPUT -o OUTPUT -p PATH -a ADJUST
 
@@ -199,79 +367,48 @@ options:
                        0），所以正值提升保留优先级、负值降低
 ```
 
-### 示例
-1. 查找并移动重复文件到指定目录：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 /path/to/dir2 --action move --move-to-dir /path/to/move_dir
-   ```
+```bash
+# Raise the keep-priority of every entry under a component named archive_2024
+# 提升路径分量含 archive_2024 的文件的保留优先级（数值减少 1）：
+python change_priority.py -i duplicates.json -o adjusted.json -p archive_2024 -a 1
+```
 
-2. 查找并删除重复文件，保留包含特定关键字的文件：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 --retain important --action delete
-   ```
+## Notes · 注意事项
 
-3. 使用自定义优先级顺序查找并处理重复文件：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 --priority-order modified_time path --action move
-   ```
+- Moving or deleting inside an actively synchronized folder propagates the
+  change to peer devices. DupFinder warns before actions when a scan root
+  contains synchronization markers such as `.stfolder` / `.sync`; heed the
+  warning. 对疑似活跃同步目录执行移动/删除会向对端设备传播，工具会在动作前
+  警示，请留意日志。
+- Prefer `--try-run` + `--export-candidates` review before the first real
+  pass, and keep the recycle dir until `--undo` confirmed the outcome.
+  首轮正式运行前建议先演练并导出清单审查；确认结果前保留回收目录。
 
-4. 尝试运行模式，仅打印操作，不实际执行：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 --try-run
-   ```
+## Repository layout · 目录结构
 
-5. 使用简写形式尝试运行模式：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 -n
-   ```
+| Path 路径 | Role 职责 |
+| --- | --- |
+| `dup_finder.py` | Main CLI: scanning, cache, actions, undo, rollback manifests 主程序：扫描、缓存、动作、清单与回滚 |
+| `pathlogic.py` | Pure helpers: path-component matching, result schema validation 纯函数：路径分量匹配、结果结构校验 |
+| `logger.py` | Logging setup (console INFO milestones, rotating file log) 日志配置 |
+| `change_priority.py` | Standalone utility to tune priorities in a result file 结果文件优先级微调脚本 |
+| `tests/` | 95 end-to-end tests driven purely through the CLI 端到端测试（仅经 CLI 进程边界） |
 
-6. 排除包含特定关键字的文件，不进行文件重复判断：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 --exclude temp --exclude pdf
-   ```
+## Contributing · 贡献
 
-7. 使用排除文件排除特定关键字的文件：
-   ```bash
-   python dup_finder.py -d /path/to/dir1 --exclude-file exclude_keywords.txt
-   ```
+See [CONTRIBUTING.md](CONTRIBUTING.md) (bilingual). Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/); the test suite
+and mypy must stay green. 见 [CONTRIBUTING.md](CONTRIBUTING.md)；提交遵循
+Conventional Commits 规范，测试与 mypy 必须保持全绿。
 
-8. 调整重复文件生成结果文件的优先级：
-   ```bash
-   # 提升路径分量含 "seagate4000g" 的文件的保留优先级（数值减少 1）
-   python change_priority.py -i duplicates.json -o adjusted.json -p seagate4000g -a 1
-   ```
+Changes worth noting per release are recorded in [CHANGELOG.md](CHANGELOG.md).
+每个版本的可见变更记于 [CHANGELOG.md](CHANGELOG.md)。
 
-9. 只审查不执行：导出待处理清单（一行一个绝对路径），人工确认后再正式运行：
-   ```bash
-   python dup_finder.py -d A B --action move -m trash --export-candidates review_list.txt --try-run
-   less review_list.txt      # 确认无误后去掉 --try-run 再执行
-   ```
+## License · 许可证
 
-10. 跨目录专属去重：去掉 B 中与 A 重复的文件，A 自身与 B 内部重复都不动：
-    ```bash
-    python dup_finder.py -d /backup/a /backup/b --cross-dirs-only --action move -m /backup/b_trash
-    ```
-
-11. 误移之后一键回滚（原位已被占用的条目自动跳过不覆盖）：
-    ```bash
-    python dup_finder.py --undo /backup/b_trash
-    ```
-
-12. 换用更长摘要算法做更严格的比对（缓存条目按算法隔离，sha256 历史缓存不受影响）：
-    ```bash
-    python dup_finder.py -d /path/to/dir1 --hash-algo sha512 --try-run
-    ```
-
-## 注意事项
-- 对疑似活跃同步目录（扫描根下存在 `.stfolder` / `.sync` 前缀标记）执行移动或删除，会随同步传播到对端设备；工具会在动作前给出警示，请留意日志。
-- 处理前建议先用 `--try-run` 与 `--export-candidates` 审查待处理清单。
-
-## 贡献
-欢迎贡献代码！请阅读 [贡献指南](CONTRIBUTING.md) 以了解如何参与开发。
-
-## 许可证
-本项目采用 GPL-3.0 许可证，详情参见 [LICENSE](LICENSE) 文件。
+This project is licensed under the [GPL-3.0](LICENSE) license.
+本项目采用 [GPL-3.0](LICENSE) 许可证。
 
 ---
 
-希望这个 README 文件能帮助你更好地理解和使用 `DupFinder`。如果有任何问题或建议，请随时提 issue 或者联系开发者.
+Questions or ideas? Open an issue. 有问题或建议，欢迎提 issue。

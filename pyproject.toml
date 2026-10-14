@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "mypy>=1.11",
 ]
 
 # 仓库保持平铺脚本结构（不重构为包），显式声明顶层模块，
