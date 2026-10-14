@@ -408,13 +408,19 @@ class DupTree:
             for p in self.artifact_paths()
         }
 
-    def load_result_json(self):
-        """加载唯一的结果 JSON（duplicates_*.json），返回 (dict, path)。"""
+    def load_result_json(self, latest: bool = False):
+        """加载结果 JSON（duplicates_*.json），返回 (dict, path)。
+
+        默认断言 workdir 内仅 1 个结果文件（单跑用例）；同一用例内多次
+        运行产生多个时，用 latest=True 取文件名时间序最新的一个。"""
         files = sorted(self.workdir.glob(DUPLICATE_GLOB))
-        assert len(files) == 1, (
-            f"workdir 下应有且仅有 1 个 {DUPLICATE_GLOB}，实际: {[f.name for f in files]}"
-        )
-        return json.loads(files[0].read_text()), files[0]
+        if not latest:
+            assert len(files) == 1, (
+                f"workdir 下应有且仅有 1 个 {DUPLICATE_GLOB}，实际: {[f.name for f in files]}"
+            )
+        else:
+            assert files, f"workdir 下没有找到任何 {DUPLICATE_GLOB}"
+        return json.loads(files[-1].read_text()), files[-1]
 
 
 # --------------------------------------------------------------------------

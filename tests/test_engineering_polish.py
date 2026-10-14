@@ -156,7 +156,8 @@ def test_sha512_run_is_namespaced_and_restores_cleanly(dup_tree):
 
     proc = t.run("-d", "A", "B", "--hash-algo", "sha512", *algo_args)
     assert proc.returncode == 0, console_output(proc)
-    data512, _ = t.load_result_json()
+    # 三段式用例每段都产结果文件，取最新（本次 sha512 运行）的那份
+    data512, _ = t.load_result_json(latest=True)
     sha512_id = "sha512:" + hashlib.sha512(PAIR_CONTENT).hexdigest()
     assert list(data512) == [sha512_id], "sha512 运行不得复用 sha256 条目（裸 hex 命中）"
     cache_v2 = _read_cache(t)
