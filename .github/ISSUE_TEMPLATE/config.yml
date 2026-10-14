@@ -1,9 +1,7 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Documentation · 文档先行
+  - name: 文档先行 Documentation
     url: https://github.com/haotianfei/DupFinder/blob/main/README.md
     about: >-
-      Check the README parameter table, examples, and CHANGELOG first; if
-      something is unclear or wrong there, open a bug report or a feature
-      request using the templates. 先查阅 README 参数表、示例与 CHANGELOG；
-      文档不清楚或有误，请用对应模板提 issue。
+      先查阅 README 参数表、示例与 CHANGELOG；文档不清楚或有误，请用对应模板提 issue。
+      Check the README parameter table, examples, and CHANGELOG first; if something is unclear or wrong there, open a report or a suggestion using the templates.
