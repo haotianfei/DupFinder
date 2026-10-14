@@ -24,7 +24,7 @@ is announced in the entry body.
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-10-14
 
 ### 新增
 
@@ -316,5 +316,5 @@ baseline. Highlights, grouped by kind.
   sign direction the code actually implements (positive raises retention
   priority by subtracting, clamped at 0).
 
-[Unreleased]: https://github.com/haotianfei/DupFinder/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/haotianfei/DupFinder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/haotianfei/DupFinder/releases/tag/v0.1.0
