@@ -54,11 +54,11 @@ class _CacheWriteSampler(threading.Thread):
         self.cache_path = str(cache_path)
         self.interval = interval
         self.changes = []
-        self._stop = threading.Event()
+        self._halt = threading.Event()
 
     def run(self):
         last = None
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             ns = self._peek()
             if ns != last:
                 if ns is not None:
@@ -73,7 +73,7 @@ class _CacheWriteSampler(threading.Thread):
             return None
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
         self.join(timeout=5)
         # 最后一次替换可能紧贴进程退出发生，收尾时补采一次
         ns = self._peek()
