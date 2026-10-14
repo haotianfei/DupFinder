@@ -26,11 +26,122 @@ is announced in the entry body.
 
 ## [Unreleased]
 
-暂无未发布变更。
+### 新增
+
+- 异名重复门禁（renamed-dupes gate，默认开启）：处理队列最终确定之后，候选与
+  组内保留项 basename 不同时移出执行队列、写入待审清单，绝不自动删除/移动；
+  同名重复（跨目录同步副本）照常处理。动机：内容相同而文件名不同的两个文件
+  可能各有引用语义（配置路径、应用绑定），"内容重复"≠"引用冗余"。
+- `renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt` 待审清单：与结果 JSON 同目录，
+  纯文本 TSV 标记格式（**opt-out**：行默认预标记 `x`=拟执行；保护=改成空格或
+  `-`、或直接删行；`!`=病态路径行永不执行，未知标记/缺列=坏行告警剔除），列为
+  标记<TAB>候选绝对路径<TAB>保留绝对路径<TAB>sha256<TAB>size，按组聚集并带
+  `# kept:` 注释头；排序稳定（重跑逐字节一致，diff 友好），上千条场景可用
+  sed/vim 批量保护。`--try-run` 下照常写出（审查产物豁免）；无异名项时不产生
+  文件。
+- body-sha256 未经审阅拒绝门：清单头部记录 `# body-sha256: <hex>`，正文=文件
+  中所有不以 `#` 开头的行（含空行）按原始字节以 `\n` 连接计算 sha256。
+  `--approve` 启动先重算比对：一致=从生成起未被人工编辑（只改注释不解锁）→
+  拒绝 rc1 零动作并提示先审阅或使用 `--approve-all`；头部缺该记录的文件
+  （手工伪造/损坏）同样拒绝。此门承担"误跑未编辑清单"的安全底线，使默认方向
+  可以安全地取 `x`（opt-out 批量更方便）。
+- `--approve PATH`：审批执行通道（代码形状对齐 `--undo`，与
+  `-d/--undo/--duplicates-result-file` 互斥，rc2）。只执行行首恰为 `x` 的行；
+  每行执行前四项校验：候选存在且 size 与记录一致（skipped_gone）、mtime 较
+  扫描时点变化仅告警（warn_modified，不拦截）、内容摘要与记录一致——经哈希
+  缓存命中、miss 现算（skipped_mismatch）、保留项仍在位（skipped_kept_gone）；
+  通过后走主流程同款 delete/move 通道（回收目录结构、同盘/异盘空间检查一致），
+  move 逐条写标准 `moves_*.jsonl` 清单 → `--undo` 天然回滚；收尾打印
+  executed/skipped/mismatch/total 计数（恒自洽）。
+- `--approve-all`：`--approve` 的零编辑逃逸开关——跳过 body-sha256 审阅门，
+  执行清单中全部 `x` 行（显式给出该参数本身即人工审阅声明）；被保护、被删与
+  `!` 行依然永不执行。须与 `--approve` 连用，单独使用报 rc2。
+- `--renamed-pending-prefix PATH`：待审清单输出目录/文件名前缀。
+- `--no-gate-renamed`：关闭门禁，恢复"全部入选候选照常处理"的旧行为。
+- `tests/test_renamed_gate.py`：门禁与审批闭环 23 个端到端用例（判定、清单
+  格式与 opt-out 默认标记、body-sha256 重算与拒绝门三态、保护/删行/
+  --approve-all、审批校验分桶、病态路径、互斥、manifest→undo 全链路）。
+
+### 变更
+
+- **破坏性（默认值）：** 异名重复候选默认不再被自动删除/移动——此前一切入选
+  候选直接执行，现在 basename 与保留项不同者一律进入待审清单，须经人工审阅
+  （改标记保护要留的文件/删行，或直接 `--approve-all` 全批）并 `--approve`
+  方可执行（文件安全优先，安全底线由 body-sha256 未经审阅拒绝门承担）。
+  保持旧行为请显式传 `--no-gate-renamed`。
+- `--export-candidates` 导出的仍是完整选择队列（不受门禁截留影响）；当门禁
+  开启且确有异名项被截留时，清单末尾追加一行注释说明实际处理集更小。
+- 端到端测试套件扩展至 118 用例；既有依赖"异名重复被处理"断言的用例逐条
+  显式传 `--no-gate-renamed`，原断言语义未弱化。
 
 ---
 
-No unreleased changes yet.
+### Added
+
+- Renamed-dupes gate (ON by default): once the processing queue is final, a
+  candidate whose basename differs from its group's kept file leaves the
+  execution queue and lands in a review file instead of being deleted or
+  moved; same-name duplicates (synchronized copies) keep being processed.
+  Rationale: identical content under different names can carry different
+  reference semantics (config paths, application bindings) — duplicate
+  content is not redundant reference.
+- `renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt` review file: written next to
+  the result JSON, plain-text TSV with a leading single-character mark column
+  (**opt-out**: rows come pre-marked `x` = intended for processing; protect by
+  flipping the mark to ' ' or `-`, or delete the row; `!` = pathological path,
+  never executed; unknown marks / wrong field count = malformed, rejected at
+  parse with warning) and columns mark<TAB>candidate<TAB>kept<TAB>sha256<TAB>
+  size; rows group under `# kept:` comment headers, sorting is stable (reruns
+  produce byte-identical files, diff-friendly), thousands of rows are
+  batch-protectable with sed/vim. It is also written under `--try-run` (review
+  artifact exemption) and never created when nothing is held back.
+- body-sha256 review gate: the header records `# body-sha256: <hex>` over the
+  body — all lines not starting with `#` (blank lines included), raw bytes
+  joined with `\n`. `--approve` recomputes first: equal means nobody edited
+  the list since generation (comment-only changes do not unlock) → rc1, zero
+  actions, with a hint to review or use `--approve-all`; a missing record
+  (hand-forged or damaged header) is refused the same way. This file-level
+  floor is what makes the default direction safely `x`.
+- `--approve PATH`: the approval channel (same code shape as `--undo`,
+  mutually exclusive with `-d/--undo/--duplicates-result-file`, rc2). Check 0
+  is the review gate above; then only rows marked exactly `x` execute and each
+  passes four checks first —
+  candidate exists with the recorded size (skipped_gone), mtime drift since
+  the scan only warns (warn_modified, non-blocking), content digest matches
+  via the hash cache or a fresh hash (skipped_mismatch), and the kept file is
+  still in place (skipped_kept_gone). Approved rows then go through the main
+  delete/move machinery (identical recycle-dir structure and free-space
+  guard), moves append standard `moves_*.jsonl` entries so `--undo` rolls
+  them back, and an executed/skipped/mismatch/total summary is printed.
+- `--approve-all`: the zero-edit escape hatch for `--approve` — skip the
+  body-sha256 gate and execute every `x` row (passing the flag is itself the
+  human review declaration); protected (' '/'-'), deleted and `!` rows still
+  never execute. Must be combined with `--approve`; alone it errors (rc2).
+- `--renamed-pending-prefix PATH`: output directory or file-name prefix for
+  the review file.
+- `--no-gate-renamed`: disables the gate and restores the old behavior of
+  processing every selected candidate.
+- `tests/test_renamed_gate.py`: 23 end-to-end cases for the gate and the
+  approval loop (decision, pending format and opt-out default marks,
+  body-sha256 recompute and review-gate states, protect/delete/all-approve,
+  verification buckets, pathological paths, mutual exclusion,
+  manifest-to-undo round trip).
+
+### Changed
+
+- **Breaking (defaults):** renamed candidates are no longer auto-deleted or
+  auto-moved — everything that used to act on the full queue now holds back
+  any candidate whose basename differs from its kept file until a human
+  reviews the list (protect rows with ' '/'-' or delete them, or accept
+  everything with `--approve-all`) and runs `--approve` (file safety first;
+  the body-sha256 review gate is the floor). Pass `--no-gate-renamed`
+  explicitly to keep the old behavior.
+- `--export-candidates` still exports the full selection queue (the gate does
+  not shrink the export); when the gate holds items back, a trailing comment
+  line notes that the actually-processed set is smaller.
+- The end-to-end suite grew to 118 cases; existing cases that assert renamed
+  duplicates being processed now pass `--no-gate-renamed` explicitly, keeping
+  their original assertions intact.
 
 ## [0.1.0] - 2026-10-14
 

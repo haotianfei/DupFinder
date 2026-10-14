@@ -9,6 +9,10 @@ validate_result_schema 守卫——顶层 dict[str, list]、条目 dict 且含 s
 经缓存播种（两条不同 size 文件共享同一缓存 file_id）在扫描路径构造触发。
 
 全部经 CLI 进程边界断言外部行为。
+
+test_valid_result_file_load_behavior_unchanged 依赖异名候选（p.txt/p-copy.txt）
+进入演练动作，显式传 --no-gate-renamed 保持原断言语义（gate 本体行为由
+tests/test_renamed_gate.py 覆盖）。
 """
 
 import hashlib
@@ -151,7 +155,7 @@ def test_valid_result_file_load_behavior_unchanged(dup_tree):
     before = t.snapshot()
 
     proc = t.run("-d", "A", "B", "--try-run",
-                 "--duplicates-result-file", "review_result.json")
+                 "--duplicates-result-file", "review_result.json", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert "Loaded file_dict from review_result.json" in out

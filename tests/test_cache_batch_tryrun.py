@@ -6,6 +6,10 @@ SIGINT/SIGTERM 中断时在锁内受控落盘一次并以非零码干净退出�
 预热起跑两态）。
 
 全部经 CLI 进程边界断言外部行为。
+
+两个 try-run 演练断言用例（"[TRY RUN]" 动作行与产物集合钉桩）依赖异名对
+（x_cross.txt/x_cross.dup 等）被处理，显式传 --no-gate-renamed 保持原断言语义
+（gate 本体行为由 tests/test_renamed_gate.py 覆盖）。
 """
 
 import json
@@ -270,7 +274,7 @@ def test_try_run_cold_start_writes_no_formal_artifacts(dup_tree):
     before = t.snapshot()
     names_before = sorted(os.listdir(t.workdir))
 
-    proc = t.run_scan()
+    proc = t.run_scan("--no-gate-renamed")
     console = console_output(proc)
     assert proc.returncode == 0, console
     assert "[TRY RUN]" in console
@@ -295,7 +299,7 @@ def test_try_run_leaves_prewarmed_cache_byte_identical(dup_tree):
     names_before = sorted(os.listdir(t.workdir))
     before = t.snapshot()
 
-    proc = t.run_scan()
+    proc = t.run_scan("--no-gate-renamed")
     console = console_output(proc)
     assert proc.returncode == 0, console
 

@@ -6,6 +6,10 @@
 兄弟目录名（A 与 A-nm）不串根。
 
 全部经 CLI 进程边界断言外部行为（退出码、真实 move 终态、结果 JSON、日志）。
+
+跨根对被移走的一侧全部是异名（xover/b-over、x1/y1），断言依赖其被处理，故相应
+运行显式传 --no-gate-renamed 保持原断言语义（gate 本体行为由
+tests/test_renamed_gate.py 覆盖）。
 """
 
 import hashlib
@@ -74,7 +78,8 @@ def test_cross_flag_processes_only_cross_root_group(dup_tree):
     _build_two_root_fixture(t)
     before = t.snapshot()
 
-    proc = t.run("-d", "A", "B", "--cross-dirs-only", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--cross-dirs-only", "--action", "move", "-m", "trash",
+                 "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -118,7 +123,7 @@ def test_cross_flag_with_retain_component_keeps_a_side_untouched(dup_tree):
     before = t.snapshot()
 
     proc = t.run("-d", "A", "B", "--cross-dirs-only", "--action", "move",
-                 "-m", "trash", "--retain", "dirA")
+                 "-m", "trash", "--retain", "dirA", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -210,7 +215,7 @@ def test_sibling_roots_attribution_does_not_leak_between_A_and_A_nm(dup_tree):
     before = t.snapshot(under=("A", "A-nm"))
 
     proc = t.run("-d", "A", "A-nm", "--cross-dirs-only", "--action", "move",
-                 "-m", "trash", "--retain", "x1.txt")
+                 "-m", "trash", "--retain", "x1.txt", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 

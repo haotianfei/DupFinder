@@ -2,6 +2,11 @@
 单次 stat 快照下的行为等价、缓存条目格式兼容与零重算。
 
 全部经 CLI 进程边界断言外部行为（退出码、控制台输出、文件系统终态、产物 JSON）。
+
+凡断言"每组恰一个成员被处理"的用例（try-run 动作行、实删、实移、预热复用后的
+moved==1）都依赖异名对（x_cross.txt/x_cross.dup、y_indir1/y_indir2 等）被处理，
+显式传 --no-gate-renamed 保持原断言语义（gate 本体行为由 tests/test_renamed_gate.py
+覆盖；仅验证扫描/缓存/结果 JSON 的用例保持默认 gate 运行）。
 """
 
 import hashlib
@@ -92,7 +97,7 @@ def test_empty_and_symlink_untouched_under_try_run(full_tree):
     汇总计数正确，演练动作恰好覆盖两个真实重复组各一次，且正式产物零写入。"""
     t = full_tree
     before = t.snapshot()
-    proc = t.run_scan()
+    proc = t.run_scan("--no-gate-renamed")
     console = console_output(proc)
 
     assert proc.returncode == 0, console
@@ -118,7 +123,7 @@ def test_empty_and_symlink_untouched_under_delete(full_tree):
     """--action delete：重复组各实删一个文件，但 0 字节/软链接/不可读文件终态零触碰。"""
     t = full_tree
     before = t.snapshot()
-    proc = t.run("-d", "A", "B", "--action", "delete")
+    proc = t.run("-d", "A", "B", "--action", "delete", "--no-gate-renamed")
     console = console_output(proc)
 
     assert proc.returncode == 0, console
@@ -143,7 +148,7 @@ def test_empty_and_symlink_untouched_under_move(full_tree):
     t = full_tree
     t.mkdir("trash")
     before = t.snapshot()
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     console = console_output(proc)
 
     assert proc.returncode == 0, console
@@ -328,7 +333,7 @@ def test_warm_cache_reused_without_rehash(dup_tree_factory):
         entry["file_id"] = sentinel
     t.cache_path().write_text(json.dumps(cache))
 
-    proc = _real_run(t)
+    proc = _real_run(t, "--no-gate-renamed")
     assert proc.returncode == 0, console_output(proc)
 
     data, _ = t.load_result_json()

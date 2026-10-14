@@ -5,6 +5,9 @@
   "algo:" 前缀做命名空间隔离，互不污染
 - 魔法值提为命名常量/CLI 参数后，显式传默认值与不传的行为逐字段一致
 - change_priority.py 不再因导入主程序而拉起日志副作用
+
+test_min_free_percent_threshold_is_live 依赖异名重复（b1.bin/b2.bin）被处理，显式
+传 --no-gate-renamed 保持原断言语义（gate 本体行为由 tests/test_renamed_gate.py 覆盖）。
 """
 
 import hashlib
@@ -232,7 +235,7 @@ def test_min_free_percent_threshold_is_live(dup_tree):
     t.add_file("B/b2.bin", PAIR_CONTENT)
 
     proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash",
-                 "--retain", "b2.bin", "--min-free-percent", "100")
+                 "--retain", "b2.bin", "--min-free-percent", "100", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert "insufficient" in out or "空间不足" in out

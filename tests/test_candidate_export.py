@@ -8,6 +8,10 @@
 不阻塞；更深位置的标记与无标记根不警示。
 
 全部经 CLI 进程边界断言外部行为。
+
+本套件的重复对全部是异名（xover.txt/xover-copy.txt、i1/i2、j1/j2），断言语义依赖
+"异名候选被处理"，故逐条显式传 --no-gate-renamed 保持原断言（gate 本体行为由
+tests/test_renamed_gate.py 覆盖）。
 """
 
 import json
@@ -89,7 +93,7 @@ def test_exported_candidates_match_actual_move_queue_line_by_line(dup_tree):
     assert not (t.workdir / "review").exists()          # 导出父目录不存在 → 自动创建
 
     proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash",
-                 "--export-candidates", "review/list.txt")
+                 "--export-candidates", "review/list.txt", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -129,7 +133,7 @@ def test_try_run_with_export_writes_list_and_touches_nothing(dup_tree):
     before = t.snapshot()
 
     proc = t.run("-d", "A", "B", "--try-run",
-                 "--export-candidates", "review/candidates.txt")
+                 "--export-candidates", "review/candidates.txt", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -160,7 +164,7 @@ def test_exported_candidates_match_delete_queue(dup_tree):
                   for pair in (CROSS_PAIR, A_INTERNAL, B_INTERNAL) for rel in pair}
 
     proc = t.run("-d", "A", "B", "--action", "delete",
-                 "--export-candidates", "del_list.txt")
+                 "--export-candidates", "del_list.txt", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -187,7 +191,7 @@ def test_export_after_cross_dirs_filter_contains_only_cross_root_queue(dup_tree)
     _build_three_groups(t)
 
     proc = t.run("-d", "A", "B", "--try-run", "--cross-dirs-only",
-                 "--export-candidates", "cross.txt")
+                 "--export-candidates", "cross.txt", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -213,7 +217,7 @@ def test_behavior_without_export_flag_is_unchanged(dup_tree):
     t.mkdir("trash")
     _build_three_groups(t)
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert len(_moved_sources(out)) == 3
@@ -244,7 +248,7 @@ def test_sync_marker_direct_child_warns_and_actions_continue(dup_tree, marker):
     t.mkdir(f"A/{marker}")
     _build_cross_pair_only(t)
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 
@@ -264,7 +268,7 @@ def test_clean_scan_roots_produce_no_sync_warning(dup_tree):
     t.mkdir("trash")
     _build_cross_pair_only(t)
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert "synchronized folder" not in out
@@ -280,7 +284,7 @@ def test_marker_deeper_than_direct_child_does_not_warn(dup_tree):
     t.mkdir("A/sub/.stfolder")
     _build_cross_pair_only(t)
 
-    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash")
+    proc = t.run("-d", "A", "B", "--action", "move", "-m", "trash", "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
     assert "synchronized folder" not in out
@@ -297,7 +301,8 @@ def test_export_creates_missing_parent_directories(dup_tree):
     _build_cross_pair_only(t)
     assert not (t.workdir / "a").exists()
 
-    proc = t.run("-d", "A", "B", "--try-run", "--export-candidates", "a/b/c/list.txt")
+    proc = t.run("-d", "A", "B", "--try-run", "--export-candidates", "a/b/c/list.txt",
+                 "--no-gate-renamed")
     out = console_output(proc)
     assert proc.returncode == 0, out
 

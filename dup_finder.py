@@ -595,14 +595,14 @@ def assign_priorities(file_dict: FileDict, retain_keywords: list[str] | None,
 
 
 def select_files_for_processing(file_dict: FileDict) -> list[tuple[str, FileEntry]]:
-    """Return [(file_id, file_info), ...] in the exact order and set retain_files acts on.
+    """Return [(file_id, file_info), ...] in the exact order the action phase acts on.
 
     Selection rule (unchanged from the action phase itself): within each
     duplicate group, files are ordered by priority ascending; the lowest
     priority value is the retained baseline and every file with a strictly
     higher (worse) priority number joins the processing queue. Shared by
-    retain_files and the candidate-list export so the exported list cannot
-    drift from what actually gets processed.
+    the renamed-dupes gate, the action loop and the candidate-list export so
+    the exported list cannot drift from what actually gets processed.
     """
     queue: list[tuple[str, FileEntry]] = []
     for file_id, files in file_dict.items():
@@ -614,12 +614,240 @@ def select_files_for_processing(file_dict: FileDict) -> list[tuple[str, FileEntr
     return queue
 
 
-def export_candidates(paths: Iterable[str], out_path: str) -> bool:
+# ---------------------------------------------------------------------------
+# 异名重复门禁（renamed-dupes gate）：默认保护 + 待审清单
+#
+# 动机：内容相同但 basename 不同的文件可能各有引用语义（配置路径、应用绑定），
+# "内容重复"≠"引用冗余"。同名重复（跨目录同步副本）风险低照常处理；异名重复
+# 默认移出处理队列、写入待审清单，只有人工把行首标记改成 'x' 并经 --approve
+# 通道四项校验后方可执行。文件安全优先：gate 默认开启，未经编辑的清单零效果。
+# ---------------------------------------------------------------------------
+
+# 待审清单行首标记列（单字符，opt-out 语义，spec v2 §3）：
+#   x=拟执行（生成默认）；' ' 或 -=保护保留（否决方式一，留审计痕迹）；
+#   删行=不执行（否决方式二）；!=病态路径（永不执行，--approve-all 亦不执行）；
+#   其余标记/缺列=坏行，解析告警剔除。
+PENDING_MARK_APPROVED = "x"
+PENDING_MARK_KEEP = " "
+PENDING_MARK_PROTECT = "-"
+PENDING_MARK_NEVER = "!"
+PENDING_MARKS = (PENDING_MARK_KEEP, PENDING_MARK_APPROVED, PENDING_MARK_PROTECT,
+                 PENDING_MARK_NEVER)
+# 病态文件名字符：会破坏"一行一条记录"的 TSV 结构，出现即整行降级为 '!'
+PENDING_PATHOLOGICAL_CHARS = ("\t", "\n", "\r")
+RENAMED_PENDING_FILE_PREFIX = "renamed_pending_"
+
+# 待审清单固定头部（注释行，不参与执行、也不计入 body-sha256）。模板按 spec §3
+# 逐字，`<hex>` 占位写文件时替换为正文重算摘要；批量示例给出反向（保护）命令。
+# body 定义：文件中所有不以 '#' 开头的行（含空行），按原始字节以 '\n' 连接。
+# 未经审阅拒绝门（§3）：body 重算 == 头部记录（= 未人工编辑，只改注释不算审阅）
+# 或头部缺记录 → --approve 拒绝 rc1；--approve-all 显式跳过该门。
+PENDING_BODY_SHA_PLACEHOLDER = "# body-sha256: <hex>"
+PENDING_FILE_HEADER_TEMPLATE = (
+    "# Renamed-duplicate review file / 异名重复审批清单\n"
+    "# Mark column (single char + TAB): 'x' = approved for processing (default)\n"
+    "#   ' ' or '-' = protected, keep in place; delete line = never executed; "
+    "'!' = pathological, never executed\n"
+    "#   anything else / missing mark = malformed, rejected at parse with warning\n"
+    "# Columns: mark <TAB> candidate_path <TAB> kept_path <TAB> sha256 <TAB> size\n"
+    "# File with unedited body => --approve refuses (rc1) unless --approve-all.\n"
+    "# body-sha256: <hex>\n"
+    "#\n"
+    "# Batch examples:\n"
+    "#   sed -i 's/^x/-/' <file>                    # protect everything\n"
+    "#   vim -c ':g/keepassxc/s/^x/ /' <file>       # pattern-based batch protect"
+)
+
+# 待审行 / 审批条目的数据形状类型别名
+GatedEntry = tuple[str, FileEntry, FileEntry]           # (file_id, candidate, kept)
+ApprovedRow = tuple[str, str, str, int]                 # (candidate, kept, file_id, size)
+
+
+def split_queue_by_rename_gate(
+    queue: list[tuple[str, FileEntry]],
+    file_dict: FileDict,
+) -> tuple[list[tuple[str, FileEntry]], list[GatedEntry]]:
+    """Split the final processing queue into same-name work and renamed holds.
+
+    Runs after select_files_for_processing has fixed the queue, so delete and
+    move modes are gated identically. For each (file_id, candidate) the kept
+    baseline K is the group's entry with the lowest priority number (ties keep
+    their stable order). `os.path.basename(candidate) == os.path.basename(K)`
+    keeps the item in the queue; anything else leaves the queue and enters the
+    pending review list instead, never processed without an explicit
+    --approve. The kept file itself is never processed (unchanged behavior)
+    and takes no part in the decision. Returns (processable, gated) where
+    gated rows carry (file_id, candidate, kept).
+    """
+    baseline: dict[str, FileEntry] = {
+        file_id: min(files, key=lambda f: f['priority'])
+        for file_id, files in file_dict.items() if files
+    }
+    processable: list[tuple[str, FileEntry]] = []
+    gated: list[GatedEntry] = []
+    for file_id, candidate in queue:
+        kept = baseline[file_id]
+        if os.path.basename(candidate['path']) == os.path.basename(kept['path']):
+            processable.append((file_id, candidate))
+        else:
+            gated.append((file_id, candidate, kept))
+    return processable, gated
+
+
+def renamed_pending_output_path(prefix: str | None) -> str:
+    """Pick this run's review file name (microsecond timestamp keeps reruns diff-friendly).
+
+    Default: `renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt` in the working
+    directory — the same place the result JSON lives. With
+    --renamed-pending-prefix: an existing directory or a value ending in a
+    path separator keeps the default file name inside that directory; any
+    other value is used as a file-name prefix (`<prefix>_<timestamp>.txt`).
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    default_name = f"{RENAMED_PENDING_FILE_PREFIX}{timestamp}.txt"
+    if prefix is None:
+        return default_name
+    if prefix.endswith((os.sep, "/")) or os.path.isdir(prefix):
+        return os.path.join(prefix, default_name)
+    return f"{prefix}_{timestamp}.txt"
+
+
+def _is_pathological_path(path: str) -> bool:
+    """True when a path carries characters that would break the one-line-per-row TSV."""
+    return any(ch in path for ch in PENDING_PATHOLOGICAL_CHARS)
+
+
+def _escape_pathological(path: str) -> str:
+    """Backslash-escape separators so a pathological path still occupies one line.
+
+    Only ever applied to '!'-marked rows (never executed); a hand-edited 'x'
+    on such a row resolves to the escaped literal path, which does not exist
+    on disk and is reported skipped_gone — the pathological entry stays
+    protected even if the mark is tampered with.
+    """
+    return (path.replace("\\", "\\\\")
+                .replace("\t", "\\t")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r"))
+
+
+def _pending_row_size(candidate: FileEntry) -> int:
+    """Size column for a gated candidate; -1 means "unknown" (skips the size check).
+
+    Scan-built entries always carry 'size'; a hand-assembled result JSON fed
+    via --duplicates-result-file may omit it, so fall back to a stat and, if
+    even that fails, record -1 and let the hash check carry the verification.
+    """
+    size = candidate.get('size')
+    if isinstance(size, int):
+        return size
+    try:
+        return os.stat(candidate['path']).st_size
+    except OSError:
+        return -1
+
+
+def _review_body_sha(text: str) -> str:
+    """Body digest of a review file (spec §3): every line NOT starting with '#'
+    (blank lines included), kept as raw line bytes, joined with '\\n' in file
+    order, hashed with sha256. Header comments — including the recorded
+    '# body-sha256:' line itself — are excluded, so editing comments never
+    unlocks the review gate while any body edit (mark change, row delete,
+    added row) flips the digest."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()                      # trailing newline is not an extra empty row
+    body = "\n".join(line for line in lines if not line.startswith("#"))
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _recorded_body_sha(text: str) -> str | None:
+    """The '# body-sha256: <hex>' value from the header block, or None when the
+    record is missing/empty (hand-forged or damaged file — also rejected)."""
+    for line in text.splitlines():
+        if line.startswith("# body-sha256:"):
+            recorded = line.split(":", 1)[1].strip()
+            return recorded or None
+    return None
+
+
+def write_renamed_pending(gated: list[GatedEntry], out_path: str) -> bool:
+    """Write the review file for the renamed candidates the gate held back.
+
+    A pure review artifact (like --export-candidates): written even under
+    --try-run. Opt-out semantics (spec v2 §3): every normal row is generated
+    pre-marked 'x' (intended for processing) — protecting means flipping the
+    mark to ' '/'-' or deleting the row — and the unedited file is guarded by
+    the body-sha256 review gate instead: the header records the digest of the
+    body, and a plain --approve refuses (rc1) until the body was actually
+    edited or --approve-all is passed. Format: header comment block, then
+    rows sorted by (group hash, kept path, candidate path) — stable across
+    reruns so two pending files diff cleanly — each group led by a `# kept:`
+    comment, each row `mark<TAB>candidate<TAB>kept<TAB>file_id<TAB>size`.
+    Paths are written absolute (the --approve channel executes them directly).
+    Rows whose candidate or kept path contains TAB/newline get mark '!'
+    (never executed, not even via --approve-all), backslash-escaped paths and
+    a warning comment, keeping one physical line per record — escaped rows stay
+    inside the body digest without ever breaking the line structure. Returns
+    True on success; on failure logs the error and returns False, and the
+    caller stops before any action so the review artifact for held-back files
+    is never silently missing.
+    """
+    absolute_out = os.path.abspath(out_path)
+    rows = sorted(
+        ((file_id, os.path.abspath(kept['path']), os.path.abspath(candidate['path']),
+          candidate, kept)
+         for file_id, candidate, kept in gated),
+        key=lambda row: row[:3],
+    )
+    try:
+        parent = os.path.dirname(absolute_out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        lines: list[str] = []
+        current_kept: str | None = None
+        for _file_id, kept_path, cand_path, candidate, _kept in rows:
+            pathological = _is_pathological_path(cand_path) or _is_pathological_path(kept_path)
+            if kept_path != current_kept:
+                shown = _escape_pathological(kept_path) if pathological else kept_path
+                lines.append(f"# kept: {shown}")
+                current_kept = kept_path
+            if pathological:
+                lines.append("# WARNING: pathological path (TAB/newline in name) — row marked '!' "
+                             f"and never executed (even via --approve-all): {cand_path!r}")
+            mark = PENDING_MARK_NEVER if pathological else PENDING_MARK_APPROVED
+            fields = (
+                mark,
+                _escape_pathological(cand_path) if pathological else cand_path,
+                _escape_pathological(kept_path) if pathological else kept_path,
+                _file_id,
+                str(_pending_row_size(candidate)),
+            )
+            lines.append("\t".join(fields))
+        body_sha = _review_body_sha("\n".join(lines) + "\n")
+        header = PENDING_FILE_HEADER_TEMPLATE.replace("<hex>", body_sha)
+        with open(absolute_out, "w") as out_file:
+            out_file.write(header + "\n")
+            for line in lines:
+                out_file.write(line + "\n")
+    except OSError as e:
+        logger.error("Cannot write renamed-dupes review file to %s: %s", out_path, e)
+        return False
+    logger.info("Renamed-dupes review file written: %s (%d candidate(s))",
+                out_path, len(rows))
+    return True
+
+
+def export_candidates(paths: Iterable[str], out_path: str, gated_count: int = 0) -> bool:
     """Write the pending-processing list, one absolute source path per line.
 
     Pure output of the already-decided processing queue (cross-root filtering,
     retain keywords and priority selection have all run beforehand); it changes
-    no selection itself. Missing parent directories of out_path are created.
+    no selection itself, and the renamed-dupes gate does not shrink the export
+    either — the export is the truth of the selection queue. When the gate is
+    on and holds items back (gated_count > 0), a trailing comment line states
+    that the actually-processed set is smaller while the gate stays on.
+    Missing parent directories of out_path are created.
     Returns True on success; on failure logs the error and returns False, and
     the caller stops before any action so a requested review artifact is never
     silently missing.
@@ -631,6 +859,13 @@ def export_candidates(paths: Iterable[str], out_path: str) -> bool:
         with open(absolute_out, "w") as out_file:
             for path in path_list:
                 out_file.write(os.path.abspath(path) + "\n")
+            if gated_count:
+                out_file.write(
+                    "# NOTE: the renamed-dupes gate is ON: %d of the listed candidate(s) "
+                    "differ in basename from their kept file and are held back for review "
+                    "(renamed_pending_*.txt) instead of processed; --no-gate-renamed "
+                    "processes everything as before.\n" % gated_count
+                )
     except OSError as e:
         logger.error("Cannot write candidate list to %s: %s", out_path, e)
         return False
@@ -638,11 +873,12 @@ def export_candidates(paths: Iterable[str], out_path: str) -> bool:
     return True
 
 
-def retain_files(file_dict: FileDict, action: str, move_to_dir: str | None = None,
-                 try_run: bool = False, manifest: "MoveManifest | None" = None,
-                 min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
-    """Retain files based on the priority and process the rest."""
-    for file_id, file in select_files_for_processing(file_dict):
+def process_queue(queue: list[tuple[str, FileEntry]], action: str,
+                  move_to_dir: str | None = None,
+                  try_run: bool = False, manifest: "MoveManifest | None" = None,
+                  min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
+    """Run the action over the final (post-gate) processing queue."""
+    for file_id, file in queue:
         process_file(file, action, move_to_dir, try_run, file_id, manifest, min_free_percent)
 
 
@@ -655,76 +891,87 @@ def retain_files(file_dict: FileDict, action: str, move_to_dir: str | None = Non
 def process_file(file: FileEntry, action: str, move_to_dir: str | None = None,
                  try_run: bool = False, file_id: str | None = None,
                  manifest: "MoveManifest | None" = None,
-                 min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
+                 min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> bool:
+    """Execute one delete/move/rename action; return True only if the filesystem changed.
+
+    False covers unsupported actions, try-run prints, free-space refusals and
+    any OSError/Exception during the operation. The --approve channel counts
+    executed entries from this return value; the main loop ignores it.
+    """
     # 操作类型校验
     if action not in ['delete', 'move']:
         logger.warning(f"Unsupported action: {action}. Skipping file: {file['path']}")
-        return
+        return False
 
     if action == 'delete':
         if try_run:
             logger.info(f"[TRY RUN] Would delete: {file['path']}")
-        else:
-            try:
-                os.remove(file['path'])
-                logger.info(f"Deleted: {file['path']}")
-            except Exception as e:
-                logger.error(f"Error deleting {file['path']}: {e}")
-    elif action == 'move':
-        if move_to_dir:
-            # 目标路径按 file_id 建子目录；缺失 id 属于内部异常调用，拒绝执行而非拼出错误路径
-            if file_id is None:
-                logger.error("Internal error: move with --move-to-dir requires a file id for %s",
-                             file['path'])
-                return
-            # 创建file_id目录
-            target_dir = os.path.join(move_to_dir, file_id)
-            # 获取源文件的相对路径（基于系统根目录）
-            source_dir = os.path.dirname(file['path'])
-            relative_dir = os.path.relpath(source_dir, start='/')  # 转换为相对路径以避免绝对路径问题
-            # 构建目标子目录
-            target_subdir = os.path.join(target_dir, relative_dir)
-            
-            if not os.path.exists(target_subdir):
-                os.makedirs(target_subdir)
-            
-            # 保持原始文件名
-            file_name = os.path.basename(file['path'])
-            new_path = os.path.join(target_subdir, file_name)
-            
-            if try_run:
-                logger.info(f"[TRY RUN] Would move: {file['path']} to {new_path}")
-            else:
-                # 新增空间检查逻辑（开始）
-                total, used, free = shutil.disk_usage(move_to_dir)
-                file_size = os.path.getsize(file['path'])
-                free_percent = (free / total * 100) if total > 0 else 0
-                logger.debug(f"移动文件需要空间：{file_size} 字节，剩余空间: {free} 字节 ({free_percent:.1f}%)")
+            return False
+        try:
+            os.remove(file['path'])
+            logger.info(f"Deleted: {file['path']}")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting {file['path']}: {e}")
+            return False
+    # action == 'move'
+    if move_to_dir:
+        # 目标路径按 file_id 建子目录；缺失 id 属于内部异常调用，拒绝执行而非拼出错误路径
+        if file_id is None:
+            logger.error("Internal error: move with --move-to-dir requires a file id for %s",
+                         file['path'])
+            return False
+        # 创建file_id目录
+        target_dir = os.path.join(move_to_dir, file_id)
+        # 获取源文件的相对路径（基于系统根目录）
+        source_dir = os.path.dirname(file['path'])
+        relative_dir = os.path.relpath(source_dir, start='/')  # 转换为相对路径以避免绝对路径问题
+        # 构建目标子目录
+        target_subdir = os.path.join(target_dir, relative_dir)
+        
+        if not os.path.exists(target_subdir):
+            os.makedirs(target_subdir)
+        
+        # 保持原始文件名
+        file_name = os.path.basename(file['path'])
+        new_path = os.path.join(target_subdir, file_name)
+        
+        if try_run:
+            logger.info(f"[TRY RUN] Would move: {file['path']} to {new_path}")
+            return False
+        # 新增空间检查逻辑（开始）
+        total, used, free = shutil.disk_usage(move_to_dir)
+        file_size = os.path.getsize(file['path'])
+        free_percent = (free / total * 100) if total > 0 else 0
+        logger.debug(f"移动文件需要空间：{file_size} 字节，剩余空间: {free} 字节 ({free_percent:.1f}%)")
 
-                # 空间不足判断
-                if free < file_size or free_percent < min_free_percent:
-                    logger.error(f"空间不足阻止移动：{file['path']} -> {new_path}")
-                    logger.error(f"需要空间: {file_size} 字节 | 剩余空间: {free} 字节 ({free_percent:.1f}%)")
-                    return
-                # 新增空间检查逻辑（结束）
-                try:
-                    shutil.move(file['path'], new_path)
-                    logger.info(f"Moved: {file['path']} to {new_path}")
-                    # 每条实际成功的移动即时写入 JSONL 清单（rename 模式无回收目录，不产清单）
-                    if manifest is not None:
-                        manifest.record(file['path'], new_path)
-                except Exception as e:
-                    logger.error(f"Error moving {file['path']} to {new_path}: {e}")
-        else:
-            new_path = file['path'] + '.dup_finder'
-            if try_run:
-                logger.info(f"[TRY RUN] Would rename: {file['path']} to {new_path}")
-            else:
-                try:
-                    shutil.move(file['path'], new_path)
-                    logger.info(f"Renamed: {file['path']} to {new_path}")
-                except Exception as e:
-                    logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
+        # 空间不足判断
+        if free < file_size or free_percent < min_free_percent:
+            logger.error(f"空间不足阻止移动：{file['path']} -> {new_path}")
+            logger.error(f"需要空间: {file_size} 字节 | 剩余空间: {free} 字节 ({free_percent:.1f}%)")
+            return False
+        # 新增空间检查逻辑（结束）
+        try:
+            shutil.move(file['path'], new_path)
+            logger.info(f"Moved: {file['path']} to {new_path}")
+            # 每条实际成功的移动即时写入 JSONL 清单（rename 模式无回收目录，不产清单）
+            if manifest is not None:
+                manifest.record(file['path'], new_path)
+            return True
+        except Exception as e:
+            logger.error(f"Error moving {file['path']} to {new_path}: {e}")
+            return False
+    new_path = file['path'] + '.dup_finder'
+    if try_run:
+        logger.info(f"[TRY RUN] Would rename: {file['path']} to {new_path}")
+        return False
+    try:
+        shutil.move(file['path'], new_path)
+        logger.info(f"Renamed: {file['path']} to {new_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Error renaming {file['path']} to {new_path}: {e}")
+        return False
 
 
 def main(directories: list[str], action: str, priority_order: list[str] | None = None,
@@ -734,7 +981,22 @@ def main(directories: list[str], action: str, priority_order: list[str] | None =
          cache_batch: int = DEFAULT_CACHE_BATCH, cross_dirs_only: bool = False,
          undo: str | None = None, export_candidates_path: str | None = None,
          hash_algo: str = DEFAULT_HASH_ALGO,
-         min_free_percent: float = DEFAULT_MIN_FREE_PERCENT) -> None:
+         min_free_percent: float = DEFAULT_MIN_FREE_PERCENT,
+         approve: str | None = None, gate_renamed: bool = True,
+         renamed_pending_prefix: str | None = None,
+         approve_all: bool = False) -> None:
+    if approve is not None:
+        # --approve 与扫描互斥（代码形状对齐 --undo 早退通道）：只吃审批清单，
+        # 不扫描、不写缓存、不产结果文件；哈希校验经只读缓存，miss 则现算。
+        # body-sha256 审阅门在通道内第 0 项执行，--approve-all 显式跳过。
+        counts = approve_renamed_pending(approve, action, move_to_dir, min_free_percent,
+                                         approve_all=approve_all)
+        logger.info(
+            "Approve summary: executed=%d skipped=%d mismatch=%d total=%d",
+            counts["executed"], counts["skipped"], counts["mismatch"], counts["total"]
+        )
+        return
+
     if undo is not None:
         # --undo 与扫描互斥：只按清单反向恢复，不扫描、不读缓存、不产结果文件
         manifests = collect_move_manifests(undo)
@@ -789,14 +1051,36 @@ def main(directories: list[str], action: str, priority_order: list[str] | None =
                 json.dump(file_dict, f, indent=4)
             logger.info(f"Saved file_dict to {output_file}")
 
-    # 待处理候选清单：在处理队列确定（cross-dirs 过滤 + retain/优先级选择）之后、
-    # 任何动作执行之前导出；写失败则停止，绝不带着未审查的清单继续执行
+    # 处理队列最终确定（cross-dirs 过滤 + retain/优先级选择）之后、任何动作之前：
+    # 先算 gate 截留，再导候选清单（导出=选择队列真相，不受截留影响），
+    # 异名项转入待审清单，最后只执行存活队列
+    queue = select_files_for_processing(file_dict)
+    if gate_renamed:
+        actionable, gated = split_queue_by_rename_gate(queue, file_dict)
+    else:
+        actionable, gated = list(queue), []
+
+    # 待处理候选清单：在任何动作执行之前导出；写失败则停止，绝不带着未审查的清单继续执行
     if export_candidates_path is not None:
-        pending_paths = [file_info['path'] for _file_id, file_info in select_files_for_processing(file_dict)]
-        if not export_candidates(pending_paths, export_candidates_path):
+        pending_paths = [file_info['path'] for _file_id, file_info in queue]
+        if not export_candidates(pending_paths, export_candidates_path, gated_count=len(gated)):
             sys.exit(1)
 
-    retain_files(file_dict, action, move_to_dir, try_run, manifest, min_free_percent)
+    if gated:
+        # gate 拦截的异名项全部落入待审清单（与 --export-candidates 同等豁免：
+        # try-run 也写；无异名项时不产文件）。清单写失败则停止——绝不生成
+        # "文件被静默丢弃审查机会"的执行。未编辑的清单本身零效果。
+        pending_path = renamed_pending_output_path(renamed_pending_prefix)
+        if not write_renamed_pending(gated, pending_path):
+            sys.exit(1)
+        logger.info(
+            "Renamed-dupes gate: held %d renamed candidate(s) for review; "
+            "%d same-name candidate(s) stay in the processing queue; "
+            "pending review file: %s",
+            len(gated), len(actionable), pending_path
+        )
+
+    process_queue(actionable, action, move_to_dir, try_run, manifest, min_free_percent)
     if manifest is not None:
         manifest.log_summary()
 
@@ -931,11 +1215,238 @@ def undo_moves(manifest_paths: list[str]) -> dict[str, int]:
 
     return counts
 
+
+# ---------------------------------------------------------------------------
+# --approve 审批执行通道（代码形状对齐 --undo：main 顶部早退、清单驱动、计数收尾）
+# ---------------------------------------------------------------------------
+
+def detect_file_id_hash_algo(file_id: str) -> str:
+    """Hash algorithm implied by a review-file id: bare hex is the default sha256,
+    a '<algo>:' prefix names its own algorithm (cache namespace round-trip)."""
+    head, sep, _ = file_id.partition(":")
+    if sep and head in HASH_ALGO_CHOICES:
+        return head
+    return DEFAULT_HASH_ALGO
+
+
+def load_cache_readonly(cache_file: str = 'file_cache.json') -> Cache:
+    """Best-effort read-only load of the hash cache for --approve verification.
+
+    The approve channel never writes the cache (unlike a scan): an unreadable
+    or corrupt cache simply means an empty in-memory cache and the hash check
+    falls back to re-digesting each file.
+    """
+    try:
+        with open(cache_file, 'r') as f:
+            data = json.load(f)
+    except (OSError, json.decoder.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def normalize_cache_paths(cache: Cache) -> Cache:
+    """Re-key a loaded cache by absolute path so lookups hit regardless of form.
+
+    Scan keys follow the -d arguments verbatim, so a relative scan (the common
+    case) stores 'B/file.ext' while the review file carries '/cwd/B/file.ext'.
+    Without this view the approval checks would never hit the cache: the mtime
+    warning could not fire and every hash would silently re-compute. Entries
+    already stored in absolute form win over relative spellings of the same
+    file (applied second), and the original mapping is left untouched.
+    """
+    normalized: Cache = {}
+    for absolute_pass in (False, True):
+        for key, entry in cache.items():
+            if not isinstance(entry, dict):
+                continue
+            if os.path.isabs(key) is not absolute_pass:
+                continue
+            try:
+                normalized[os.path.abspath(key)] = entry
+            except (ValueError, OSError):
+                continue
+    return normalized
+
+
+def parse_renamed_pending(pending_path: str) -> list[ApprovedRow]:
+    """Extract the executable ('x'-marked) rows from a renamed-dupes review file.
+
+    Grammar (mirrors what write_renamed_pending emits, opt-out semantics):
+    '#' comment lines and blank lines are inert; a data row is exactly 5
+    TAB-separated fields whose first field is a single mark out of 'x'
+    (approved — the generated default), ' ' or '-' (protected, not executed),
+    '!' (pathological, not executed). Only 'x' rows return. Safety against a
+    stray --approve over the untouched file is NOT the mark default (it is 'x')
+    but the body-sha256 review gate enforced in approve_renamed_pending. '!'
+    rows are never executable: even if the mark is hand-edited to 'x' the
+    escaped literal path no longer resolves and the four-check pass reports it
+    skipped_gone. Unknown marks or a wrong field count are malformed and warn
+    + drop without counting, mirroring the undo channel's malformed handling.
+    """
+    entries: list[ApprovedRow] = []
+    with open(pending_path, "r") as f:
+        for line_number, raw_line in enumerate(f, 1):
+            line = raw_line.rstrip("\r\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            if len(fields) != 5 or fields[0] not in PENDING_MARKS:
+                logger.warning("Malformed review line at %s:%d, skipped", pending_path, line_number)
+                continue
+            if fields[0] != PENDING_MARK_APPROVED:
+                continue
+            _mark, candidate, kept, file_id, size_text = fields
+            if not candidate or not kept or not file_id:
+                logger.warning("Malformed review line at %s:%d, skipped", pending_path, line_number)
+                continue
+            try:
+                size = int(size_text)
+            except ValueError:
+                logger.warning("Malformed review line at %s:%d (size is not an integer), skipped",
+                               pending_path, line_number)
+                continue
+            entries.append((candidate, kept, file_id, size))
+    return entries
+
+
+def approve_renamed_pending(pending_file: str, action: str, move_to_dir: str | None,
+                            min_free_percent: float, approve_all: bool = False) -> dict[str, int]:
+    """Execute the 'x'-approved rows of a review file (the approval channel).
+
+    Check 0 (file level, spec §3 review gate): unless --approve-all is passed,
+    the body-sha256 recorded in the header is recomputed against the current
+    body — equal means the file was never human-edited since generation
+    (comment-only edits do not unlock), and a missing/corrupt record means the
+    header was not produced by a real run — either way the run refuses (rc1)
+    with zero actions. Passing --approve-all skips the gate: the explicit flag
+    is itself the human review declaration for an all-approve decision, and
+    protected (' '/'-'), deleted and '!' rows still never execute.
+
+    Environment between review and approval may have changed (e.g. active
+    syncthing), so every row then passes four checks before any file is touched:
+      1. candidate exists and its size matches the recorded one  -> else skipped_gone
+         (a recorded size of -1 means "unknown at review time" and defers to the hash check)
+      2. mtime differs from the scan-time value in the cache     -> warn_modified, continue
+         (same size + same digest means the same semantics)
+      3. content digest matches the recorded id (cache-backed, re-hashed on miss)
+                                                                 -> else skipped_mismatch
+      4. the kept file still exists at its recorded path         -> else skipped_kept_gone
+    Execution reuses process_file, so the move target structure, the
+    same-device/cross-device free-space guard and the lazily created
+    moves_*.jsonl manifest at the recycle-dir root all match the main flow —
+    --undo rolls approved moves back with no extra steps. Executed rows are
+    never written back into the user's review file (it stays re-appliable);
+    the audit trail is the moves manifest. Returns counts {"executed",
+    "skipped", "mismatch", "total"} where skipped folds gone/kept_gone and
+    execution failures (each warned with its class name), so
+    executed + skipped + mismatch == total always holds.
+    """
+    if not os.path.isfile(pending_file):
+        logger.error("Approve target is not a readable review file: %s", pending_file)
+        sys.exit(1)
+
+    if not approve_all:
+        with open(pending_file, "r") as f:
+            review_text = f.read()
+        recorded = _recorded_body_sha(review_text)
+        if recorded is None:
+            logger.error(
+                "Approve refused: %s carries no '# body-sha256:' record (the header was not "
+                "produced by a real run, or was damaged) — regenerate the review file or use "
+                "--approve-all as an explicit review declaration", pending_file)
+            sys.exit(1)
+        if recorded == _review_body_sha(review_text):
+            logger.error(
+                "Approve refused: the body of %s is unedited since the file was generated "
+                "(body-sha256 matches). Reviewing means editing the rows: protect the files to "
+                "keep ('x' -> ' ' or '-', or delete the row) — comment-only changes do not "
+                "unlock this gate. To accept every 'x' row as-is, rerun with --approve-all.",
+                pending_file)
+            sys.exit(1)
+
+    entries = parse_renamed_pending(pending_file)
+
+    # 只读缓存视图（统一为绝对 key）：校验 2 的扫描时点 mtime 与校验 3 的摘要
+    # 命中都经由它；miss 则现算，审批通道全程不写缓存
+    cache = normalize_cache_paths(load_cache_readonly())
+    manifest = None
+    if action == 'move' and move_to_dir:
+        # 与主流程同款的懒创建清单：审批执行的移动同样天然可 --undo
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        manifest = MoveManifest(os.path.join(move_to_dir, f"moves_{current_time}.jsonl"))
+
+    counts = {"executed": 0, "skipped": 0, "mismatch": 0, "total": 0}
+    warn_modified = 0
+    for candidate_path, kept_path, file_id, size in entries:
+        counts["total"] += 1
+        # 清单行内路径以绝对形态写出；再过一遍 abspath 兜住手写/规范化差异，
+        # 并保证与 abspath 形态的缓存视图在同一 key 空间命中
+        candidate_path = os.path.abspath(candidate_path)
+        kept_path = os.path.abspath(kept_path)
+        # 校验 1：候选存在且 size 与行内记录一致
+        try:
+            st = os.stat(candidate_path)
+        except OSError:
+            counts["skipped"] += 1
+            logger.warning("Approve skipped_gone (candidate vanished): %s", candidate_path)
+            continue
+        if size >= 0 and st.st_size != size:
+            counts["skipped"] += 1
+            logger.warning("Approve skipped_gone (size changed %d -> %d): %s",
+                           size, st.st_size, candidate_path)
+            continue
+        # 校验 2：mtime 与扫描时点（缓存登记值）不一致 → 仅告警，继续
+        cached = cache.get(candidate_path)
+        if isinstance(cached, dict):
+            cached_mtime = cached.get('modified_time')
+            if cached_mtime is not None and cached_mtime != st.st_mtime:
+                warn_modified += 1
+                logger.warning(
+                    "Approve warn_modified (file changed since the review file was generated; "
+                    "size and digest checks still apply): %s", candidate_path)
+        # 校验 3：内容摘要与行内记录一致（经缓存，miss 则现算）
+        hash_algo = detect_file_id_hash_algo(file_id)
+        try:
+            computed = get_file_id(candidate_path, cache, st, hash_algo)
+        except OSError:
+            counts["skipped"] += 1
+            logger.warning("Approve skipped_gone (candidate unreadable): %s", candidate_path)
+            continue
+        if computed != file_id:
+            counts["mismatch"] += 1
+            logger.warning("Approve skipped_mismatch (content no longer matches the recorded "
+                           "digest): %s", candidate_path)
+            continue
+        # 校验 4：保留项仍在位，否则"删重复"的组语义已失效
+        if not os.path.exists(kept_path):
+            counts["skipped"] += 1
+            logger.warning("Approve skipped_kept_gone (kept file no longer exists, group "
+                           "semantics lost): %s", kept_path)
+            continue
+        file_entry: FileEntry = {'path': candidate_path, 'size': st.st_size}
+        if process_file(file_entry, action, move_to_dir, False, file_id, manifest,
+                        min_free_percent):
+            counts["executed"] += 1
+        else:
+            counts["skipped"] += 1
+            logger.warning("Approve skipped (action reported a failure, see the error above): %s",
+                           candidate_path)
+
+    if manifest is not None:
+        manifest.log_summary()
+    if warn_modified:
+        logger.info("Approve: %d file(s) modified since the review file was generated "
+                    "(mtime differs from the cache; executed as approved)", warn_modified)
+    return counts
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Find and process duplicate files.")
     parser.add_argument("--directories", "-d", nargs='+', required=False,
                         help="Directories to search for duplicate files "
-                             "(required unless --undo is used)")
+                             "(required unless --undo or --approve is used)")
     parser.add_argument("--action", choices=['delete', 'move'], required=False, default='move', help="Action to process files (default: move)")
     parser.add_argument("--priority-order", "-p", nargs='+', required=False, help="Custom priority order: default is modified_time, path")
     parser.add_argument("--move-to-dir", "-m", required=False, help="Directory to move files to (if not specified, rename files with .dup_finder suffix)")
@@ -996,16 +1507,75 @@ if __name__ == "__main__":
                              "--try-run; combine with --try-run to only review the list, since "
                              "try-run still writes no cache, result or manifest files. The "
                              "output file is a user-requested artifact; its parent directories "
-                             "are created as needed, and the run stops before acting if the "
-                             "list cannot be written.")
+                              "are created as needed, and the run stops before acting if the "
+                              "list cannot be written.")
+    # 添加异名重复门禁开关（默认开启：异名候选只进待审清单，不执行）
+    parser.add_argument("--no-gate-renamed", action='store_true', required=False,
+                        help="Renamed-dupes gate (ON by default): a candidate whose basename "
+                             "differs from its group's kept file is held back from delete/move "
+                             "and written to a renamed_pending_*.txt review file next to the "
+                             "result JSON; same-name duplicates keep being processed as before. "
+                             "Rows come pre-marked 'x': protect what to keep ('x' -> ' ' or '-', "
+                             "or delete the row) and run --approve; an unedited list is refused "
+                             "(rc1) unless --approve-all. This flag restores the old behavior "
+                             "of processing every selected candidate without any review. "
+                             "(default: gate on)")
+    # 添加审批执行参数（与扫描互斥的早退通道，代码形状对齐 --undo）
+    parser.add_argument("--approve", required=False, metavar="PATH",
+                        help="Approval mode: execute the rows marked 'x' in a "
+                             "renamed_pending_*.txt review file (PATH). Rows are generated "
+                             "pre-marked 'x' (opt-out): to protect a file change its mark to "
+                             "' ' or '-', or delete the row. Check 0 is the review gate — a "
+                             "whose-body file nobody edited ('# body-sha256:' recomputes equal, "
+                             "comment-only edits do not unlock; a missing record is also "
+                             "refused) aborts with rc1 and zero actions unless --approve-all is "
+                             "passed. Every row then passes four checks before acting: candidate "
+                             "exists with the recorded size, content digest matches the recorded "
+                             "id (via the hash cache, re-hashed on miss), and the kept file is "
+                             "still in place; an mtime change since the review file was "
+                             "generated only warns. Approved rows go through the same "
+                             "delete/move machinery (--action move -m DIR writes a standard "
+                             "moves_*.jsonl manifest that --undo rolls back). Prints an "
+                             "executed/skipped/mismatch/total summary. Mutually exclusive with "
+                             "-d/--directories, --undo and --duplicates-result-file. Example: "
+                             "sed -i '/wechat/s/^x/-/' renamed_pending_*.txt && dup_finder.py "
+                             "--approve renamed_pending_*.txt --action move -m trash")
+    # 添加零编辑全批逃逸通道（必须与 --approve 连用）
+    parser.add_argument("--approve-all", action='store_true', required=False,
+                        help="Skip the body-sha256 review gate of --approve and execute every "
+                             "'x' row as generated: passing this flag is itself the human "
+                             "review declaration for an all-approve decision. Rows protected "
+                             "(' ' or '-'), deleted rows and '!' pathological rows still never "
+                             "execute. Must be combined with --approve PATH; using it alone is "
+                             "an error (exit code 2)")
+    # 添加待审清单输出位置参数（默认与结果 JSON 同目录）
+    parser.add_argument("--renamed-pending-prefix", required=False, metavar="PATH",
+                        help="Where the renamed-dupes review file is written (default: "
+                             "renamed_pending_<YYYYmmdd_HHMMSS_ffffff>.txt next to the result "
+                             "JSON, i.e. the working directory). An existing directory or a "
+                             "value ending in a path separator keeps the default file name "
+                             "inside it; any other value is used as a file-name prefix: "
+                             "<PATH>_<YYYYmmdd_HHMMSS_ffffff>.txt")
 
     args = parser.parse_args()
-    # --undo 与扫描参数互斥：恢复模式不要求 -d，也不做扫描/缓存/结果文件任何动作
-    if args.undo:
+    # --approve-all 只是 --approve 的逃逸开关：单独使用无清单可吃，报错（rc2）
+    if args.approve_all and not args.approve:
+        parser.error("--approve-all must be combined with --approve PATH")
+    # --approve 与扫描/回滚/结果载入互斥：审批通道只吃清单，不要求 -d（形状对齐 --undo）
+    if args.approve:
+        if args.directories:
+            parser.error("--approve mode cannot be combined with -d/--directories")
+        if args.undo:
+            parser.error("--approve mode cannot be combined with --undo")
+        if args.duplicates_result_file:
+            parser.error("--approve mode cannot be combined with --duplicates-result-file")
+    elif args.undo:
+        # --undo 与扫描参数互斥：恢复模式不要求 -d，也不做扫描/缓存/结果文件任何动作
         if args.directories:
             parser.error("--undo rollback mode cannot be combined with -d/--directories")
     elif not args.directories:
-        parser.error("the following arguments are required: --directories/-d (or use --undo PATH)")
+        parser.error("the following arguments are required: --directories/-d "
+                     "(or use --undo PATH / --approve PATH)")
     # 使用 subprocess.list2cmdline 重建命令行字符串
     command_line = subprocess.list2cmdline(sys.argv)
     logger.info("Full command line: %s", command_line)
@@ -1025,7 +1595,10 @@ if __name__ == "__main__":
              file_dict_path=args.duplicates_result_file, min_size=args.min_size,
              cache_batch=args.cache_batch, cross_dirs_only=args.cross_dirs_only,
              undo=args.undo, export_candidates_path=args.export_candidates,
-             hash_algo=args.hash_algo, min_free_percent=args.min_free_percent)
+             hash_algo=args.hash_algo, min_free_percent=args.min_free_percent,
+             approve=args.approve, gate_renamed=not args.no_gate_renamed,
+             renamed_pending_prefix=args.renamed_pending_prefix,
+             approve_all=args.approve_all)
     except CacheInterrupted:
         # 扫描循环已在锁内完成一次受控落盘；此处只做非零码干净退出，不打印 traceback
         sys.exit(1)

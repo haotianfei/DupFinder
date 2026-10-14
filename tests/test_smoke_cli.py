@@ -2,6 +2,10 @@
 
 只断言当前已有行为。空文件跳过、cross-dirs-only 语义、--try-run 不写正式缓存等
 属后续计划中的行为升级，本套件不对它们预设断言。
+
+两个动作断言用例（演练动作行、恰一个 .dup_finder 改名）依赖异名对被处理，显式
+传 --no-gate-renamed 保持原断言语义（gate 本体行为由 tests/test_renamed_gate.py
+覆盖）。
 """
 
 import hashlib
@@ -40,6 +44,10 @@ def test_help_lists_every_existing_flag(dup_tree):
         "--duplicates-result-file",
         "--undo",
         "--export-candidates",
+        "--no-gate-renamed",
+        "--approve",
+        "--approve-all",
+        "--renamed-pending-prefix",
     ):
         assert opt in out, f"help 缺少既有参数 {opt}"
     for short in ("-d", "-p", "-m", "-n"):
@@ -60,7 +68,7 @@ def test_minimal_try_run_scan_reports_without_formal_artifacts(dup_tree):
     dup_tree.build_minimal()
     before = dup_tree.snapshot()
 
-    proc = dup_tree.run_scan()  # -d A B --try-run
+    proc = dup_tree.run_scan("--no-gate-renamed")  # -d A B --try-run（gate 关闭保持旧断言）
     assert proc.returncode == 0, proc.stderr
     console = proc.stdout + proc.stderr
 
@@ -95,7 +103,7 @@ def test_full_scan_run_writes_wellformed_result_json(dup_tree):
     expected_sha = hashlib.sha256(dup_tree.cross_content).hexdigest()
     content = dup_tree.cross_content
 
-    proc = dup_tree.run("-d", "A", "B")  # 默认 action=move，未给 -m → 原位改名 .dup_finder
+    proc = dup_tree.run("-d", "A", "B", "--no-gate-renamed")  # 默认 action=move，未给 -m → 原位改名 .dup_finder
     console = proc.stdout + proc.stderr
     assert proc.returncode == 0, console
 
